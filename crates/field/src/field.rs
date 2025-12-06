@@ -8,12 +8,11 @@ use std::{
 };
 
 use binius_utils::{DeserializeBytes, SerializeBytes};
+use bytemuck::Zeroable;
 
 use crate::{
 	Random,
 	arithmetic_traits::{InvertOrZero, Square},
-	as_packed_field::PackScalar,
-	underlier::WithUnderlier,
 };
 
 /// This trait is based on `ff::Field` with some unused functionality removed.
@@ -49,9 +48,7 @@ pub trait Field:
 	+ Square
 	+ InvertOrZero
 	+ Random
-	// `Underlier: PackScalar<Self>` is an obvious property but it can't be deduced by the compiler so we are id here.
-	// TODO: Move this to BinaryField instead of Field
-	+ WithUnderlier<Underlier: PackScalar<Self>>
+	+ Zeroable
 	+ SerializeBytes
 	+ DeserializeBytes
 {
@@ -63,6 +60,9 @@ pub trait Field:
 
 	/// The characteristic of the field.
 	const CHARACTERISTIC: usize;
+
+	/// Fixed generator of the multiplicative group.
+	const MULTIPLICATIVE_GENERATOR: Self;
 
 	/// Returns true iff this element is zero.
 	fn is_zero(&self) -> bool {
