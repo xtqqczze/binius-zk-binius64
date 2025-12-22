@@ -17,6 +17,11 @@ use bytemuck::zeroed_vec;
 
 use crate::Error;
 
+/// Trait for types that can provide multiple mutable field slices.
+pub trait AsSlicesMut<P: PackedField, const N: usize> {
+	fn as_slices_mut(&mut self) -> [FieldSliceMut<'_, P>; N];
+}
+
 /// A power-of-two-sized buffer containing field elements, stored in packed fields.
 ///
 /// This struct maintains a set of invariants:
@@ -339,7 +344,7 @@ impl<P: PackedField, Data: Deref<Target = [P]>> FieldBuffer<P, Data> {
 	/// # Throws
 	///
 	/// * [`Error::CannotSplit`] if `self.log_len() == 0`
-	pub fn split_half(&self) -> Result<(FieldSlice<'_, P>, FieldSlice<'_, P>), Error> {
+	pub fn split_half_ref(&self) -> Result<(FieldSlice<'_, P>, FieldSlice<'_, P>), Error> {
 		if self.log_len == 0 {
 			return Err(Error::CannotSplit);
 		}
@@ -505,7 +510,7 @@ impl<P: PackedField, Data: DerefMut<Target = [P]>> FieldBuffer<P, Data> {
 			.take(chunk_count)
 			.map(move |chunk| FieldBuffer {
 				log_len: log_chunk_size,
-				values: FieldSliceDataMut::Slice(chunk),
+				values: chunk,
 			});
 
 		Ok(chunks)
@@ -572,47 +577,47 @@ impl<P: PackedField, Data: DerefMut<Target = [P]>> FieldBuffer<P, Data> {
 		Ok(FieldBufferChunkMut(inner))
 	}
 
-	/// Splits the buffer in half and returns a [`FieldBufferSplitMut`] for accessing the halves.
+	/// Consumes the buffer and splits it in half, returning a [`FieldBufferSplitMut`].
 	///
-	/// This returns an object that can be used to access mutable references to the two halves.
-	/// This method unfortunately can't simply return a tuple of slices because the buffer may have
-	/// only one packed element. If the buffer contains a single packed element that needs to be
-	/// split, this method will create temporary copies, call the closure, and then write the
-	/// results back to the original buffer when the returned [`FieldBufferSplitMut`] is dropped.
+	/// This returns an object that owns the buffer data and can be used to access mutable
+	/// references to the two halves. If the buffer contains a single packed element that needs
+	/// to be split, the returned struct will create temporary copies and write the results back
+	/// to the original buffer when dropped.
 	///
 	/// # Throws
 	///
 	/// * [`Error::CannotSplit`] if `self.log_len() == 0`
-	pub fn split_half_mut(&mut self) -> Result<FieldBufferSplitMut<'_, P>, Error> {
+	pub fn split_half(self) -> Result<FieldBufferSplitMut<P, Data>, Error> {
 		if self.log_len == 0 {
 			return Err(Error::CannotSplit);
 		}
 
 		let new_log_len = self.log_len - 1;
-		if new_log_len < P::LOG_WIDTH {
-			// Extract the values using interleave
+		let singles = if new_log_len < P::LOG_WIDTH {
 			let packed = self.values[0];
 			let zeros = P::default();
 			let (lo_half, hi_half) = packed.interleave(zeros, new_log_len);
-
-			Ok(FieldBufferSplitMut(FieldBufferSplitMutInner::Singles {
-				log_len: new_log_len,
-				lo_half,
-				hi_half,
-				parent: &mut self.values[0],
-			}))
+			Some([lo_half, hi_half])
 		} else {
-			// Normal case: split the packed values slice in half
-			let half_len = 1 << (new_log_len - P::LOG_WIDTH);
-			let (lo_half, hi_half) = self.values.split_at_mut(half_len);
-			let hi_half = &mut hi_half[..half_len];
+			None
+		};
 
-			Ok(FieldBufferSplitMut(FieldBufferSplitMutInner::Slices {
-				log_len: new_log_len,
-				lo_half,
-				hi_half,
-			}))
-		}
+		Ok(FieldBufferSplitMut {
+			log_len: new_log_len,
+			singles,
+			data: self.values,
+		})
+	}
+
+	/// Splits the buffer in half and returns a [`FieldBufferSplitMut`] for accessing the halves.
+	///
+	/// This is a convenience method equivalent to `self.to_mut().split_half()`.
+	///
+	/// # Throws
+	///
+	/// * [`Error::CannotSplit`] if `self.log_len() == 0`
+	pub fn split_half_mut(&mut self) -> Result<FieldBufferSplitMut<P, &'_ mut [P]>, Error> {
+		self.to_mut().split_half()
 	}
 }
 
@@ -627,6 +632,14 @@ impl<P: PackedField, Data: DerefMut<Target = [P]>> AsMut<[P]> for FieldBuffer<P,
 	#[inline]
 	fn as_mut(&mut self) -> &mut [P] {
 		&mut self.values[..1 << self.log_len.saturating_sub(P::LOG_WIDTH)]
+	}
+}
+
+impl<P: PackedField, Data: DerefMut<Target = [P]>, const N: usize> AsSlicesMut<P, N>
+	for [FieldBuffer<P, Data>; N]
+{
+	fn as_slices_mut(&mut self) -> [FieldSliceMut<'_, P>; N] {
+		self.each_mut().map(|buf| buf.to_mut())
 	}
 }
 
@@ -648,7 +661,7 @@ impl<F: Field, Data: DerefMut<Target = [F]>> IndexMut<usize> for FieldBuffer<F, 
 pub type FieldSlice<'a, P> = FieldBuffer<P, FieldSliceData<'a, P>>;
 
 /// Alias for a field buffer over a mutably borrowed slice.
-pub type FieldSliceMut<'a, P> = FieldBuffer<P, FieldSliceDataMut<'a, P>>;
+pub type FieldSliceMut<'a, P> = FieldBuffer<P, &'a mut [P]>;
 
 impl<'a, P: PackedField> FieldSlice<'a, P> {
 	/// Create a new FieldSlice from a slice of packed values.
@@ -678,7 +691,7 @@ impl<'a, P: PackedField> FieldSliceMut<'a, P> {
 	/// * `IncorrectArgumentLength` if the number of field elements does not fit the `slice.len()`
 	///   exactly.
 	pub fn from_slice(log_len: usize, slice: &'a mut [P]) -> Result<Self, Error> {
-		FieldBuffer::new(log_len, FieldSliceDataMut::Slice(slice))
+		FieldBuffer::new(log_len, slice)
 	}
 }
 
@@ -707,102 +720,61 @@ impl<'a, P> Deref for FieldSliceData<'a, P> {
 	}
 }
 
-#[derive(Debug)]
-pub enum FieldSliceDataMut<'a, P> {
-	Single(P),
-	Slice(&'a mut [P]),
-}
-
-impl<'a, P> Deref for FieldSliceDataMut<'a, P> {
-	type Target = [P];
-
-	fn deref(&self) -> &Self::Target {
-		match self {
-			FieldSliceDataMut::Single(val) => slice::from_ref(val),
-			FieldSliceDataMut::Slice(slice) => slice,
-		}
-	}
-}
-
-impl<'a, P> DerefMut for FieldSliceDataMut<'a, P> {
-	fn deref_mut(&mut self) -> &mut Self::Target {
-		match self {
-			FieldSliceDataMut::Single(val) => slice::from_mut(val),
-			FieldSliceDataMut::Slice(slice) => slice,
-		}
-	}
-}
-
 /// Return type of [`FieldBuffer::split_half_mut`].
 #[derive(Debug)]
-pub struct FieldBufferSplitMut<'a, P: PackedField>(FieldBufferSplitMutInner<'a, P>);
+pub struct FieldBufferSplitMut<P: PackedField, Data: DerefMut<Target = [P]>> {
+	log_len: usize,
+	singles: Option<[P; 2]>,
+	data: Data,
+}
 
-impl<'a, P: PackedField> FieldBufferSplitMut<'a, P> {
+impl<P: PackedField, Data: DerefMut<Target = [P]>> FieldBufferSplitMut<P, Data> {
 	pub fn halves(&mut self) -> (FieldSliceMut<'_, P>, FieldSliceMut<'_, P>) {
-		match &mut self.0 {
-			FieldBufferSplitMutInner::Singles {
-				log_len,
-				lo_half,
-				hi_half,
-				parent: _,
-			} => (
+		match &mut self.singles {
+			Some([lo_half, hi_half]) => (
 				FieldBuffer {
-					log_len: *log_len,
-					values: FieldSliceDataMut::Slice(slice::from_mut(lo_half)),
+					log_len: self.log_len,
+					values: slice::from_mut(lo_half),
 				},
 				FieldBuffer {
-					log_len: *log_len,
-					values: FieldSliceDataMut::Slice(slice::from_mut(hi_half)),
+					log_len: self.log_len,
+					values: slice::from_mut(hi_half),
 				},
 			),
-			FieldBufferSplitMutInner::Slices {
-				log_len,
-				lo_half,
-				hi_half,
-			} => (
-				FieldBuffer {
-					log_len: *log_len,
-					values: FieldSliceDataMut::Slice(lo_half),
-				},
-				FieldBuffer {
-					log_len: *log_len,
-					values: FieldSliceDataMut::Slice(hi_half),
-				},
-			),
+			None => {
+				let half_len = 1 << (self.log_len - P::LOG_WIDTH);
+				let (lo_half, hi_half) = self.data.split_at_mut(half_len);
+				(
+					FieldBuffer {
+						log_len: self.log_len,
+						values: lo_half,
+					},
+					FieldBuffer {
+						log_len: self.log_len,
+						values: hi_half,
+					},
+				)
+			}
 		}
 	}
 }
 
-#[derive(Debug)]
-enum FieldBufferSplitMutInner<'a, P: PackedField> {
-	Singles {
-		log_len: usize,
-		lo_half: P,
-		hi_half: P,
-		parent: &'a mut P,
-	},
-	Slices {
-		log_len: usize,
-		lo_half: &'a mut [P],
-		hi_half: &'a mut [P],
-	},
+impl<P: PackedField, Data: DerefMut<Target = [P]>> Drop for FieldBufferSplitMut<P, Data> {
+	fn drop(&mut self) {
+		if let Some([lo_half, hi_half]) = self.singles {
+			// Write back the results by interleaving them back together
+			// The arrays may have been modified by the closure
+			(self.data[0], _) = lo_half.interleave(hi_half, self.log_len);
+		}
+	}
 }
 
-impl<'a, P: PackedField> Drop for FieldBufferSplitMutInner<'a, P> {
-	fn drop(&mut self) {
-		match self {
-			Self::Singles {
-				log_len,
-				lo_half,
-				hi_half,
-				parent,
-			} => {
-				// Write back the results by interleaving them back together
-				// The arrays may have been modified by the closure
-				(**parent, _) = (*lo_half).interleave(*hi_half, *log_len);
-			}
-			Self::Slices { .. } => {}
-		}
+impl<P: PackedField, Data: DerefMut<Target = [P]>> AsSlicesMut<P, 2>
+	for FieldBufferSplitMut<P, Data>
+{
+	fn as_slices_mut(&mut self) -> [FieldSliceMut<'_, P>; 2] {
+		let (first, second) = self.halves();
+		[first, second]
 	}
 }
 
@@ -820,11 +792,11 @@ impl<'a, P: PackedField> FieldBufferChunkMut<'a, P> {
 				chunk_offset: _,
 			} => FieldBuffer {
 				log_len: *log_len,
-				values: FieldSliceDataMut::Slice(slice::from_mut(chunk)),
+				values: slice::from_mut(chunk),
 			},
 			FieldBufferChunkMutInner::Slice { log_len, chunk } => FieldBuffer {
 				log_len: *log_len,
-				values: FieldSliceDataMut::Slice(chunk),
+				values: chunk,
 			},
 		}
 	}
@@ -1253,7 +1225,7 @@ mod tests {
 		// Leave spare capacity for 32 elements
 		let buffer = FieldBuffer::<P>::from_values_truncated(&values, 5).unwrap();
 
-		let (first, second) = buffer.split_half().unwrap();
+		let (first, second) = buffer.split_half_ref().unwrap();
 		assert_eq!(first.len(), 8);
 		assert_eq!(second.len(), 8);
 
@@ -1269,7 +1241,7 @@ mod tests {
 		let values: Vec<F> = (0..4).map(F::new).collect();
 		let buffer = FieldBuffer::<P>::from_values_truncated(&values, 3).unwrap();
 
-		let (first, second) = buffer.split_half().unwrap();
+		let (first, second) = buffer.split_half_ref().unwrap();
 		assert_eq!(first.len(), 2);
 		assert_eq!(second.len(), 2);
 
@@ -1293,7 +1265,7 @@ mod tests {
 		let values: Vec<F> = vec![F::new(10), F::new(20)];
 		let buffer = FieldBuffer::<P>::from_values_truncated(&values, 3).unwrap();
 
-		let (first, second) = buffer.split_half().unwrap();
+		let (first, second) = buffer.split_half_ref().unwrap();
 		assert_eq!(first.len(), 1);
 		assert_eq!(second.len(), 1);
 
@@ -1314,7 +1286,7 @@ mod tests {
 		let values = vec![F::new(42)];
 		let buffer = FieldBuffer::<P>::from_values(&values).unwrap();
 
-		let result = buffer.split_half();
+		let result = buffer.split_half_ref();
 		assert!(matches!(result, Err(Error::CannotSplit)));
 	}
 
