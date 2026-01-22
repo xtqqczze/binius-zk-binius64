@@ -7,6 +7,36 @@ use binius_transcript::{
 
 use crate::protocols::sumcheck::{self, RoundCoeffs, SumcheckOutput};
 
+/// Returns `(m_n, m_d)` dimensions for a mask polynomial buffer.
+///
+/// The ZK MLE-check protocol uses a separable mask polynomial with `n_vars` univariate polynomials,
+/// each of degree `d`. The mask coefficients are stored in a `2^m_n × 2^m_d` matrix where:
+/// - `m_n`: log of number of rows (one per variable, padded to power of two)
+/// - `m_d`: log of row size (degree + 1 coefficients, padded to power of two)
+///
+/// The protocol imposes `n * d + 1` linear constraints on the coefficients. The `n_extra_dof`
+/// parameter specifies additional degrees of freedom needed (e.g., for FRI openings), which
+/// may increase `m_n` to ensure `2^(m_n + m_d) >= n * d + 1 + n_extra_dof`.
+///
+/// # Arguments
+///
+/// * `n_vars` - Number of variables (n).
+/// * `degree` - Degree of each univariate polynomial (d).
+/// * `n_extra_dof` - Number of additional degrees of freedom.
+///
+/// # Returns
+///
+/// A tuple `(m_n, m_d)` where the total mask buffer size is `2^(m_n + m_d)`.
+pub fn mask_buffer_dimensions(n_vars: usize, degree: usize, n_extra_dof: usize) -> (usize, usize) {
+	let min_buffer_size = n_vars * degree + 1 + n_extra_dof;
+	let m_d = (degree + 1).next_power_of_two().ilog2() as usize;
+	// m_n must be large enough to hold n_vars rows AND satisfy the DOF constraint
+	let m_n_for_vars = n_vars.next_power_of_two().ilog2() as usize;
+	let m_n_for_size = (min_buffer_size.next_power_of_two().ilog2() as usize).saturating_sub(m_d);
+	let m_n = m_n_for_vars.max(m_n_for_size);
+	(m_n, m_d)
+}
+
 /// Output of the zero-knowledge MLE-check verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyZKOutput<F: Field> {

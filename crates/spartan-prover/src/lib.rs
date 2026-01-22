@@ -53,6 +53,7 @@ where
 	verifier:
 		Verifier<P::Scalar, ParallelMerkleHasher::Digest, ParallelMerkleCompress::Compression>,
 	ntt: NeighborsLastMultiThread<GenericPreExpanded<P::Scalar>>,
+	mulcheck_mask_ntt: NeighborsLastMultiThread<GenericPreExpanded<P::Scalar>>,
 	merkle_prover: BinaryMerkleTreeProver<P::Scalar, ParallelMerkleHasher, ParallelMerkleCompress>,
 	wiring_transpose: WiringTranspose,
 	_p_marker: PhantomData<P>,
@@ -76,10 +77,15 @@ where
 		compression: ParallelMerkleCompress,
 	) -> Result<Self, Error> {
 		let cs = verifier.constraint_system();
+		let log_num_shares = binius_utils::rayon::current_num_threads().ilog2() as usize;
+
 		let subspace = verifier.fri_params().rs_code().subspace();
 		let domain_context = GenericPreExpanded::generate_from_subspace(subspace);
-		let log_num_shares = binius_utils::rayon::current_num_threads().ilog2() as usize;
 		let ntt = NeighborsLastMultiThread::new(domain_context, log_num_shares);
+
+		let mask_subspace = verifier.mulcheck_mask_fri_params().rs_code().subspace();
+		let mask_domain_context = GenericPreExpanded::generate_from_subspace(mask_subspace);
+		let mulcheck_mask_ntt = NeighborsLastMultiThread::new(mask_domain_context, log_num_shares);
 
 		let merkle_prover = BinaryMerkleTreeProver::<_, ParallelMerkleHasher, _>::new(compression);
 
@@ -89,6 +95,7 @@ where
 		Ok(Prover {
 			verifier,
 			ntt,
+			mulcheck_mask_ntt,
 			merkle_prover,
 			wiring_transpose,
 			_p_marker: PhantomData,
@@ -122,8 +129,23 @@ where
 		let public = &witness[..1 << cs.log_public()];
 		transcript.observe().write_slice(public);
 
-		// Create mask polynomial for ZK mulcheck
-		let mulcheck_mask = zk_mlecheck::Mask::<P>::random(log_mul_constraints, 2, &mut rng);
+		// Create combined buffer for mask and masks_mask (2x size for BaseFold batching)
+		let (m_n, m_d) = self.verifier.mask_dims();
+		let mask_degree = 2; // quadratic composition
+		let log_masks_buffer_size = m_n + m_d + 1; // +1 for masks_mask
+
+		let masks_buffer = FieldBuffer::<P>::new(
+			log_masks_buffer_size,
+			repeat_with(|| P::random(&mut rng))
+				.take(1 << log_masks_buffer_size.saturating_sub(P::LOG_WIDTH))
+				.collect(),
+		);
+
+		// Split: first half is the MLE-check mask, second half is the masks_mask
+		let (mask_slice, _masks_mask_slice) = masks_buffer.split_half_ref();
+
+		// Create Mask from the first half (borrowed slice)
+		let mulcheck_mask = zk_mlecheck::Mask::new(log_mul_constraints, mask_degree, mask_slice);
 
 		// Pack witness into field elements and add blinding
 		let blinding_info = cs.blinding_info();
@@ -149,11 +171,24 @@ where
 		)?;
 		transcript.message().write(&trace_commitment);
 
+		// Commit the masks buffer (includes both mask and masks_mask)
+		let CommitOutput {
+			commitment: mask_commitment,
+			committed: _mask_codeword_committed,
+			codeword: _mask_codeword,
+		} = fri::commit_interleaved(
+			self.verifier.mulcheck_mask_fri_params(),
+			&self.mulcheck_mask_ntt,
+			&self.merkle_prover,
+			masks_buffer.to_ref(),
+		)?;
+		transcript.message().write(&mask_commitment);
+
 		// Prove the multiplication constraints
 		let (mulcheck_evals, r_x) = self.prove_mulcheck(
 			cs.mul_constraints(),
 			witness_packed.to_ref(),
-			&mulcheck_mask,
+			mulcheck_mask,
 			transcript,
 		)?;
 
@@ -180,11 +215,11 @@ where
 		Ok(())
 	}
 
-	fn prove_mulcheck<Challenger_: Challenger>(
+	fn prove_mulcheck<Data: std::ops::Deref<Target = [P]>, Challenger_: Challenger>(
 		&self,
 		mul_constraints: &[MulConstraint<WitnessIndex>],
 		witness: FieldSlice<P>,
-		mask: &zk_mlecheck::Mask<P>,
+		mask: zk_mlecheck::Mask<P, Data>,
 		transcript: &mut ProverTranscript<Challenger_>,
 	) -> Result<([F; 3], Vec<F>), Error> {
 		let mulcheck_witness = wiring::build_mulcheck_witness(mul_constraints, witness);

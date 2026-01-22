@@ -8,7 +8,7 @@
 //! where each g_i(X) is a univariate polynomial of configurable degree. This separable structure
 //! allows efficient computation of round polynomials without iterating over the full hypercube.
 
-use std::iter;
+use std::{iter, ops::Deref};
 
 use binius_field::{Field, PackedField};
 use binius_math::{
@@ -19,7 +19,6 @@ use binius_transcript::{
 	fiat_shamir::{CanSample, Challenger},
 };
 use binius_verifier::protocols::{mlecheck, sumcheck::RoundCoeffs};
-use rand::CryptoRng;
 
 use super::{
 	Error, ProveSingleOutput,
@@ -37,7 +36,10 @@ use super::{
 ///
 /// The buffer is conceptually an `n × (d+1)` matrix padded to `2^m_n × 2^m_d`,
 /// with random values in the `n × (d+1)` submatrix and zeros elsewhere.
-pub struct Mask<P: PackedField> {
+///
+/// The type is generic over the buffer storage type `Data`, allowing it to work
+/// with both owned buffers (`Box<[P]>`) and borrowed slices.
+pub struct Mask<P: PackedField, Data: Deref<Target = [P]> = Box<[P]>> {
 	/// Number of variables (n)
 	n_vars: usize,
 	/// Degree of each univariate polynomial (d)
@@ -45,33 +47,18 @@ pub struct Mask<P: PackedField> {
 	/// Coefficients stored as a FieldBuffer with log_len = m_n + m_d.
 	/// Layout: row i contains [g_i(0), g_i(1), ..., g_i(d), 0, ..., 0]
 	/// where row i spans indices [i * 2^m_d, (i+1) * 2^m_d).
-	buffer: FieldBuffer<P>,
+	buffer: FieldBuffer<P, Data>,
 }
 
-impl<F: Field, P: PackedField<Scalar = F>> Mask<P> {
-	/// Creates a new random mask polynomial.
+impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> Mask<P, Data> {
+	/// Creates a new mask polynomial from a pre-allocated buffer.
 	///
 	/// # Arguments
 	///
-	/// * `n_vars` - Number of variables (n). Must be > 0.
-	/// * `degree` - Degree of each univariate polynomial (d). Must be > 0.
-	/// * `rng` - Cryptographic random number generator.
-	pub fn random(n_vars: usize, degree: usize, mut rng: impl CryptoRng) -> Self {
-		let m_n = n_vars.next_power_of_two().ilog2() as usize;
-		let m_d = (degree + 1).next_power_of_two().ilog2() as usize;
-		let log_len = m_n + m_d;
-
-		// Create buffer filled with zeros
-		let mut buffer = FieldBuffer::<P>::zeros(log_len);
-
-		// Fill the n × (d+1) submatrix with random values
-		let row_stride = 1 << m_d;
-		for i in 0..n_vars {
-			for j in 0..(degree + 1) {
-				buffer.set(i * row_stride + j, F::random(&mut rng));
-			}
-		}
-
+	/// * `n_vars` - Number of variables (n).
+	/// * `degree` - Degree of each univariate polynomial (d).
+	/// * `buffer` - Buffer with log_len = m_n + m_d.
+	pub fn new(n_vars: usize, degree: usize, buffer: FieldBuffer<P, Data>) -> Self {
 		Self {
 			n_vars,
 			degree,
@@ -140,8 +127,8 @@ impl<F: Field, P: PackedField<Scalar = F>> Mask<P> {
 	}
 }
 
-impl<P: PackedField> AsRef<FieldBuffer<P>> for Mask<P> {
-	fn as_ref(&self) -> &FieldBuffer<P> {
+impl<P: PackedField, Data: Deref<Target = [P]>> AsRef<FieldBuffer<P, Data>> for Mask<P, Data> {
+	fn as_ref(&self) -> &FieldBuffer<P, Data> {
 		&self.buffer
 	}
 }
@@ -152,9 +139,9 @@ impl<P: PackedField> AsRef<FieldBuffer<P>> for Mask<P> {
 /// where each $g_i$ is a univariate polynomial of configurable degree.
 ///
 /// This structure allows efficient round polynomial computation in O(degree) time per round.
-pub struct MleCheckMaskProver<'a, F: Field, P: PackedField<Scalar = F>> {
-	/// Reference to the mask polynomial
-	mask: &'a Mask<P>,
+pub struct MleCheckMaskProver<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> {
+	/// The mask polynomial (owned)
+	mask: Mask<P, Data>,
 	/// The evaluation point z (in high-to-low variable order)
 	eval_point: Vec<F>,
 	/// Number of variables remaining to process
@@ -173,19 +160,21 @@ enum RoundCoeffsOrClaim<F: Field> {
 	Claim(F),
 }
 
-impl<'a, F: Field, P: PackedField<Scalar = F>> MleCheckMaskProver<'a, F, P> {
+impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>>
+	MleCheckMaskProver<F, P, Data>
+{
 	/// Creates a new prover for the Libra mask polynomial.
 	///
 	/// # Arguments
 	///
-	/// * `mask` - Reference to the mask polynomial.
+	/// * `mask` - The mask polynomial (takes ownership).
 	/// * `eval_point` - The evaluation point z for the MLE-check claim, in high-to-low order.
 	/// * `eval_claim` - The claimed value of the MLE of g at the evaluation point.
 	///
 	/// # Panics
 	///
 	/// Panics if `mask.n_vars() != eval_point.len()`.
-	pub fn new(mask: &'a Mask<P>, eval_point: Vec<F>, eval_claim: F) -> Self {
+	pub fn new(mask: Mask<P, Data>, eval_point: Vec<F>, eval_claim: F) -> Self {
 		assert_eq!(mask.n_vars(), eval_point.len(), "mask n_vars must match eval_point length");
 
 		let n_vars = eval_point.len();
@@ -217,7 +206,9 @@ impl<'a, F: Field, P: PackedField<Scalar = F>> MleCheckMaskProver<'a, F, P> {
 	}
 }
 
-impl<'a, F: Field, P: PackedField<Scalar = F>> SumcheckProver<F> for MleCheckMaskProver<'a, F, P> {
+impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> SumcheckProver<F>
+	for MleCheckMaskProver<F, P, Data>
+{
 	fn n_vars(&self) -> usize {
 		self.n_vars_remaining
 	}
@@ -293,7 +284,9 @@ impl<'a, F: Field, P: PackedField<Scalar = F>> SumcheckProver<F> for MleCheckMas
 	}
 }
 
-impl<'a, F: Field, P: PackedField<Scalar = F>> MleCheckProver<F> for MleCheckMaskProver<'a, F, P> {
+impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> MleCheckProver<F>
+	for MleCheckMaskProver<F, P, Data>
+{
 	fn eval_point(&self) -> &[F] {
 		// Return remaining coordinates (high-to-low means we return the first n_vars_remaining
 		// elements)
@@ -329,9 +322,14 @@ impl<'a, F: Field, P: PackedField<Scalar = F>> MleCheckProver<F> for MleCheckMas
 /// # Panics
 ///
 /// Panics if `main_prover.n_claims() != 1`.
-pub fn prove<F: Field, P: PackedField<Scalar = F>, Challenger_: Challenger>(
+pub fn prove<
+	F: Field,
+	P: PackedField<Scalar = F>,
+	Data: Deref<Target = [P]>,
+	Challenger_: Challenger,
+>(
 	mut main_prover: impl MleCheckProver<F>,
-	mask: &Mask<P>,
+	mask: Mask<P, Data>,
 	transcript: &mut ProverTranscript<Challenger_>,
 ) -> Result<ProveSingleOutput<F>, Error> {
 	assert_eq!(
@@ -397,9 +395,12 @@ pub fn prove<F: Field, P: PackedField<Scalar = F>, Challenger_: Challenger>(
 #[cfg(test)]
 mod tests {
 	use binius_field::arch::OptimalB128;
-	use binius_math::test_utils::random_scalars;
+	use binius_math::test_utils::{random_field_buffer, random_scalars};
 	use binius_transcript::ProverTranscript;
-	use binius_verifier::{config::StdChallenger, protocols::mlecheck};
+	use binius_verifier::{
+		config::StdChallenger,
+		protocols::mlecheck::{self, mask_buffer_dimensions},
+	};
 	use rand::{SeedableRng, prelude::StdRng};
 
 	use super::*;
@@ -408,7 +409,10 @@ mod tests {
 	type B128 = OptimalB128;
 
 	/// Evaluates the mask polynomial g(X) = sum_i g_i(X_i) at a point using the Mask struct.
-	fn evaluate_mask_polynomial<P: PackedField>(mask: &Mask<P>, point: &[P::Scalar]) -> P::Scalar {
+	fn evaluate_mask_polynomial<P: PackedField, Data: Deref<Target = [P]>>(
+		mask: &Mask<P, Data>,
+		point: &[P::Scalar],
+	) -> P::Scalar {
 		iter::zip(0..mask.n_vars(), point)
 			.map(|(i, &x)| mask.evaluate_univariate(i, x))
 			.sum()
@@ -418,17 +422,19 @@ mod tests {
 		let n_vars = 6;
 		let mut rng = StdRng::seed_from_u64(0);
 
-		// Generate random mask
-		let mask = Mask::<B128>::random(n_vars, degree, &mut rng);
+		// Generate random mask buffer
+		let (m_n, m_d) = mask_buffer_dimensions(n_vars, degree, 0);
+		let buffer = random_field_buffer::<B128>(&mut rng, m_n + m_d);
 
 		// Generate random evaluation point
 		let eval_point: Vec<B128> = random_scalars(&mut rng, n_vars);
 
 		// Compute the MLE of the mask polynomial at eval_point
+		let mask = Mask::new(n_vars, degree, buffer.to_ref());
 		let eval_claim = mask.evaluate_mle(&eval_point);
 
-		// Create the prover
-		let prover = MleCheckMaskProver::new(&mask, eval_point.clone(), eval_claim);
+		// Create the prover (takes ownership of a borrowed mask view)
+		let prover = MleCheckMaskProver::new(mask, eval_point.clone(), eval_claim);
 
 		// Run the proving protocol
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
@@ -461,6 +467,7 @@ mod tests {
 		challenge_point.reverse();
 
 		// Check that the final evaluation matches direct computation
+		let mask = Mask::new(n_vars, degree, buffer.to_ref());
 		let expected_eval = evaluate_mask_polynomial(&mask, &challenge_point);
 		assert_eq!(output.multilinear_evals[0], expected_eval);
 	}
@@ -484,12 +491,15 @@ mod tests {
 	fn test_single_variable() {
 		let mut rng = StdRng::seed_from_u64(0);
 
-		// Single variable mask
-		let mask = Mask::<B128>::random(1, 2, &mut rng);
+		// Single variable mask buffer
+		let (m_n, m_d) = mask_buffer_dimensions(1, 2, 0);
+		let buffer = random_field_buffer::<B128>(&mut rng, m_n + m_d);
+
 		let eval_point: Vec<B128> = random_scalars(&mut rng, 1);
+		let mask = Mask::new(1, 2, buffer.to_ref());
 		let eval_claim = mask.evaluate_mle(&eval_point);
 
-		let prover = MleCheckMaskProver::new(&mask, eval_point.clone(), eval_claim);
+		let prover = MleCheckMaskProver::new(mask, eval_point.clone(), eval_claim);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
 		let output = prove_single_mlecheck(prover, &mut prover_transcript).unwrap();
@@ -506,6 +516,7 @@ mod tests {
 		let mut challenge_point = sumcheck_output.challenges.clone();
 		challenge_point.reverse();
 
+		let mask = Mask::new(1, 2, buffer.to_ref());
 		let expected_eval = evaluate_mask_polynomial(&mask, &challenge_point);
 		assert_eq!(output.multilinear_evals[0], expected_eval);
 	}
@@ -517,24 +528,28 @@ mod tests {
 		let mask_degree = 2;
 		let mut rng = StdRng::seed_from_u64(0);
 
-		// Generate random main mask (using Mask as a simple MleCheckProver for testing)
-		let main_mask = Mask::<B128>::random(n_vars, main_degree, &mut rng);
+		// Generate random main mask buffer (using Mask as a simple MleCheckProver for testing)
+		let (m_n, m_d) = mask_buffer_dimensions(n_vars, main_degree, 0);
+		let main_buffer = random_field_buffer::<B128>(&mut rng, m_n + m_d);
 
-		// Generate random ZK mask
-		let zk_mask = Mask::<B128>::random(n_vars, mask_degree, &mut rng);
+		// Generate random ZK mask buffer
+		let (zk_m_n, zk_m_d) = mask_buffer_dimensions(n_vars, mask_degree, 0);
+		let zk_buffer = random_field_buffer::<B128>(&mut rng, zk_m_n + zk_m_d);
 
 		// Generate random evaluation point
 		let eval_point: Vec<B128> = random_scalars(&mut rng, n_vars);
 
 		// Compute the MLE of the main polynomial at eval_point
+		let main_mask = Mask::new(n_vars, main_degree, main_buffer.to_ref());
 		let main_eval_claim = main_mask.evaluate_mle(&eval_point);
 
 		// Create the main prover (using MleCheckMaskProver as a simple MleCheckProver)
-		let main_prover = MleCheckMaskProver::new(&main_mask, eval_point.clone(), main_eval_claim);
+		let main_prover = MleCheckMaskProver::new(main_mask, eval_point.clone(), main_eval_claim);
 
 		// Run the ZK proving protocol
+		let zk_mask = Mask::new(n_vars, mask_degree, zk_buffer.to_ref());
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		let output = prove(main_prover, &zk_mask, &mut prover_transcript).unwrap();
+		let output = prove(main_prover, zk_mask, &mut prover_transcript).unwrap();
 
 		// Write the main polynomial evaluation to the transcript
 		prover_transcript
@@ -566,10 +581,12 @@ mod tests {
 		challenge_point.reverse();
 
 		// Check that the final main evaluation matches direct computation
+		let main_mask = Mask::new(n_vars, main_degree, main_buffer.to_ref());
 		let expected_main_eval = evaluate_mask_polynomial(&main_mask, &challenge_point);
 		assert_eq!(output.multilinear_evals[0], expected_main_eval);
 
 		// Check that the mask evaluation matches the zk_mask evaluation at the challenge point
+		let zk_mask = Mask::new(n_vars, mask_degree, zk_buffer.to_ref());
 		let expected_mask_eval = evaluate_mask_polynomial(&zk_mask, &challenge_point);
 		assert_eq!(mask_eval, expected_mask_eval);
 	}
