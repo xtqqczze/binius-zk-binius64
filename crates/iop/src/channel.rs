@@ -84,6 +84,6 @@ pub trait IOPVerifierChannel<F: Field>: IPVerifierChannel<F> {
 	///   `recv_oracle()`.
 	fn finish(
 		self,
-		oracle_relations: &[(Self::Oracle, F)],
-	) -> Result<Vec<MultilinearRationalEvalClaim<F>>, Error>;
+		oracle_relations: &[(Self::Oracle, Self::Elem)],
+	) -> Result<Vec<MultilinearRationalEvalClaim<Self::Elem>>, Error>;
 }
