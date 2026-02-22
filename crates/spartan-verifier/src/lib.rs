@@ -38,8 +38,8 @@ use binius_iop::{
 };
 use binius_ip::channel::IPVerifierChannel;
 use binius_math::{
-	BinarySubspace, FieldSlice,
-	multilinear::evaluate::evaluate,
+	BinarySubspace,
+	multilinear::evaluate::evaluate_inplace_scalars,
 	ntt::{NeighborsLastSingleThread, domain_context::GenericOnTheFly},
 };
 use binius_spartan_frontend::constraint_system::{
@@ -200,9 +200,6 @@ where
 		public: &[F],
 		transcript: &mut VerifierTranscript<Challenger_>,
 	) -> Result<(), Error> {
-		// Verifier observes the public input (includes it in Fiat-Shamir).
-		transcript.observe().write_slice(public);
-
 		// Create channel and delegate to verify_iop
 		let channel = self.basefold_compiler.create_channel(transcript);
 		self.verify_iop(public, channel)
@@ -216,15 +213,14 @@ where
 	/// # Arguments
 	///
 	/// * `public` - The public inputs to the constraint system
-	/// * `channel` - The IOP verifier channel (public input must be observed on transcript before
-	///   creating the channel)
+	/// * `channel` - The IOP verifier channel
 	///
 	/// # Returns
 	///
 	/// `Ok(())` if the proof is valid, `Err(_)` otherwise.
 	pub fn verify_iop<Channel>(&self, public: &[F], mut channel: Channel) -> Result<(), Error>
 	where
-		Channel: IOPVerifierChannel<F, Elem = F>,
+		Channel: IOPVerifierChannel<F>,
 	{
 		let _verify_guard =
 			tracing::info_span!("Verify", operation = "verify", perfetto_category = "operation")
@@ -239,6 +235,9 @@ where
 				actual: public.len(),
 			});
 		}
+
+		// Observe the public input (includes it in Fiat-Shamir).
+		let public_elems = channel.observe_many(public);
 
 		// Receive the trace oracle commitment.
 		let trace_oracle = channel.recv_oracle()?;
@@ -259,8 +258,7 @@ where
 		// point.
 		let r_public = channel.sample_many(cs.log_public() as usize);
 
-		let public = FieldSlice::from_slice(cs.log_public() as usize, public);
-		let public_eval = evaluate(&public, &r_public);
+		let public_eval = evaluate_inplace_scalars(public_elems, &r_public);
 
 		// Compute wiring claim components
 		let wiring_claim = wiring::compute_claim(
@@ -334,13 +332,16 @@ where
 	}
 
 	/// Returns a closure that evaluates the mask transparent polynomial at a given point.
-	fn mask_transparent(&self, r_x: &[F]) -> binius_iop::channel::TransparentEvalFn<'_, F> {
+	fn mask_transparent<'a, E: FieldOps + 'a>(
+		&self,
+		r_x: &[E],
+	) -> binius_iop::channel::TransparentEvalFn<'a, E> {
 		let (_m_n, m_d) = self.mask_dims;
 		let n_vars = r_x.len();
 		let mask_degree = 2; // quadratic composition
 		let r_x = r_x.to_vec();
 
-		Box::new(move |point: &[F]| {
+		Box::new(move |point: &[E]| {
 			// point is in low-to-high order with batch_challenge at the end.
 			// Extract the query point by excluding the batch challenge.
 			let query_point = &point[..point.len() - 1];
@@ -348,7 +349,7 @@ where
 			// Split into query_k (low-order bits) and query_j (high-order bits)
 			let (query_k, query_j) = query_point.split_at(m_d);
 
-			mlecheck::libra_eval::<F, F>(&r_x, query_j, query_k, n_vars, mask_degree)
+			mlecheck::libra_eval(&r_x, query_j, query_k, n_vars, mask_degree)
 		})
 	}
 }
