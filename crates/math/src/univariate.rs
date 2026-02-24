@@ -45,36 +45,97 @@ pub fn evaluate_univariate<F: FieldOps>(coeffs: &[F], x: F) -> F {
 /// # Returns
 /// A vector of Lagrange polynomial evaluations, one for each domain element
 pub fn lagrange_evals<F: BinaryField>(subspace: &BinarySubspace<F>, z: F) -> FieldBuffer<F> {
-	let domain: Vec<F> = subspace.iter().collect();
+	let result = lagrange_evals_scalars(subspace, z);
+	FieldBuffer::new(subspace.dim(), result.into_boxed_slice())
+}
+
+/// Scalar variant of [`lagrange_evals`] that returns a `Vec<E>` instead of a `FieldBuffer`.
+///
+/// Computes Lagrange polynomial evaluations for a binary subspace domain, converting domain
+/// points from `F` to `E` and performing all arithmetic in `E`.
+///
+/// # Parameters
+/// - `subspace`: The binary subspace defining the evaluation domain (over `F`)
+/// - `z`: The evaluation point (in `E`)
+///
+/// # Returns
+/// A vector of Lagrange polynomial evaluations, one for each domain element
+pub fn lagrange_evals_scalars<F: BinaryField, E: FieldOps + From<F>>(
+	subspace: &BinarySubspace<F>,
+	z: E,
+) -> Vec<E> {
+	let domain: Vec<E> = subspace.iter().map(E::from).collect();
 	let n = domain.len();
 
 	// Compute single barycentric weight for the additive subgroup
-	// All points have the same weight due to subgroup structure
 	let w = domain[1..]
 		.iter()
-		.fold(F::ONE, |acc, &d| acc * d)
-		.invert()
-		.unwrap_or(F::ONE);
+		.fold(E::one(), |acc, d| acc * d)
+		.invert_or_zero();
 
 	// Compute prefix products: prefix[i] = ∏_{j=0}^{i-1} (z - domain[j])
-	let mut prefixes = vec![F::ONE; n];
+	let mut prefixes = vec![E::one(); n];
 	for i in 1..n {
-		prefixes[i] = prefixes[i - 1] * (z - domain[i - 1]);
+		prefixes[i] = prefixes[i - 1].clone() * (z.clone() - domain[i - 1].clone());
 	}
 
 	// Compute suffix products: suffix[i] = ∏_{j=i+1}^{n-1} (z - domain[j])
-	let mut suffixes = vec![F::ONE; n];
+	let mut suffixes = vec![E::one(); n];
 	for i in (0..n - 1).rev() {
-		suffixes[i] = suffixes[i + 1] * (z - domain[i + 1]);
+		suffixes[i] = suffixes[i + 1].clone() * (z.clone() - domain[i + 1].clone());
 	}
 
 	// Combine prefix, suffix, and weight: L_i(z) = prefix[i] * suffix[i] * w
-	let mut result = vec![F::ZERO; n];
-	for i in 0..n {
-		result[i] = prefixes[i] * suffixes[i] * w;
-	}
+	izip!(prefixes, suffixes)
+		.map(|(p, s)| p * s * w.clone())
+		.collect()
+}
 
-	FieldBuffer::new(subspace.dim(), result.into_boxed_slice())
+/// Extrapolate a polynomial from its evaluations over a binary subspace to a point.
+///
+/// Given evaluations of a polynomial on all points of a binary subspace, computes the polynomial's
+/// value at an arbitrary point `z` using Lagrange interpolation. This is equivalent to computing
+/// the inner product of `values` with the Lagrange basis evaluations at `z`, but avoids
+/// materializing the full vector of Lagrange evaluations.
+///
+/// # Algorithm
+///
+/// Exploits the additive group structure of binary subspaces: all barycentric weights are
+/// identical, so a single weight `w = (∏_{j=1}^{n-1} domain[j])^{-1}` is computed once. The
+/// interpolated value is then `w * Σ_i values[i] * ∏_{j≠i} (z - domain[j])`, evaluated via a
+/// single linear pass using a prefix-product accumulator (same technique as
+/// [`EvaluationDomain::extrapolate`]).
+///
+/// # Complexity
+/// - Time: O(n) where n = subspace size
+/// - Space: O(1) beyond the input
+pub fn extrapolate_over_subspace<F: BinaryField, E: FieldOps + From<F>>(
+	subspace: &BinarySubspace<F>,
+	values: &[E],
+	z: E,
+) -> E {
+	let n = 1 << subspace.dim();
+	assert_eq!(values.len(), n);
+
+	// Compute single barycentric weight for the additive subgroup.
+	let w = subspace
+		.iter()
+		.skip(1)
+		.map(E::from)
+		.fold(E::one(), |acc, d| acc * d)
+		.invert_or_zero();
+
+	// Accumulate Σ_i values[i] * ∏_{j≠i} (z - domain[j]) using a prefix-product fold.
+	let (acc, _) = izip!(values, subspace.iter()).fold(
+		(E::zero(), E::one()),
+		|(acc, prod), (value, point)| {
+			let term = z.clone() - E::from(point);
+			let next_acc = acc * &term + prod.clone() * value;
+			(next_acc, prod * term)
+		},
+	);
+
+	acc * w
 }
 
 /// A domain that univariate polynomials may be evaluated on.
@@ -300,6 +361,52 @@ mod tests {
 			// Use a smaller field element for z to test the subfield scalar multiplication
 			let z = B128::from(rng.next_u64() as u128);
 			assert_eq!(extrapolate_line_packed(x0, x1, z), x0 + (x1 - x0) * z);
+		}
+	}
+
+	#[test]
+	fn test_extrapolate_over_subspace_against_evaluate_univariate() {
+		let mut rng = StdRng::seed_from_u64(0);
+
+		for log_domain_size in 0..=6 {
+			let n = 1 << log_domain_size;
+			let subspace = BinarySubspace::<F>::with_dim(log_domain_size);
+
+			// Random polynomial of degree < n
+			let coeffs: Vec<F> = random_scalars(&mut rng, n);
+
+			// Evaluate at all domain points
+			let values: Vec<F> = subspace
+				.iter()
+				.map(|point| evaluate_univariate(&coeffs, point))
+				.collect();
+
+			// Extrapolate at a random point
+			let z = F::random(&mut rng);
+			let extrapolated = extrapolate_over_subspace(&subspace, &values, z);
+			let expected = evaluate_univariate(&coeffs, z);
+
+			assert_eq!(extrapolated, expected, "Mismatch for log_domain_size={log_domain_size}");
+		}
+	}
+
+	#[test]
+	fn test_extrapolate_over_subspace_against_lagrange_evals() {
+		let mut rng = StdRng::seed_from_u64(0);
+
+		for log_domain_size in 0..=6 {
+			let n = 1 << log_domain_size;
+			let subspace = BinarySubspace::<F>::with_dim(log_domain_size);
+
+			// Random values (not necessarily from a polynomial)
+			let values: Vec<F> = random_scalars(&mut rng, n);
+
+			let z = F::random(&mut rng);
+			let extrapolated = extrapolate_over_subspace(&subspace, &values, z);
+			let lagrange = lagrange_evals_scalars(&subspace, z);
+			let expected = inner_product(values.iter().copied(), lagrange);
+
+			assert_eq!(extrapolated, expected, "Mismatch for log_domain_size={log_domain_size}");
 		}
 	}
 
