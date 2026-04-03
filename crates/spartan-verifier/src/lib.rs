@@ -17,6 +17,7 @@
 //!
 //! - [`Verifier`] - Main verification interface; call [`Verifier::setup`] with a constraint system,
 //!   then [`Verifier::verify`] with a proof and public inputs
+//! - [`IOPVerifier`] - Core IOP verification logic, independent of the compilation strategy
 //! - [`Error`] - Error type returned when proof verification fails
 //!
 //! # Related crates
@@ -28,6 +29,7 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 pub mod config;
+pub mod constraint_system;
 pub mod wiring;
 
 use binius_field::{BinaryField, field::FieldOps};
@@ -36,23 +38,19 @@ use binius_iop::{
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
 };
 use binius_ip::channel::IPVerifierChannel;
-use binius_math::{
-	BinarySubspace,
-	multilinear::evaluate::evaluate_inplace_scalars,
-	ntt::{NeighborsLastSingleThread, domain_context::GenericOnTheFly},
-};
-use binius_spartan_frontend::constraint_system::{
-	BlindingInfo, ConstraintSystem, ConstraintSystemPadded,
-};
+use binius_math::multilinear::evaluate::evaluate_inplace_scalars;
+use binius_spartan_frontend::constraint_system::ConstraintSystem;
 use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
 use binius_utils::{DeserializeBytes, checked_arithmetics::checked_log_2};
 use binius_verifier::{
-	fri::{self, MinProofSizeStrategy, calculate_n_test_queries},
+	fri::{self, MinProofSizeStrategy},
 	hash::PseudoCompressionFunction,
 	merkle_tree::BinaryMerkleTreeScheme,
-	protocols::{basefold, mlecheck, mlecheck::mask_buffer_dimensions, sumcheck},
+	protocols::{basefold, mlecheck, sumcheck},
 };
 use digest::{Digest, Output, core_api::BlockSizeUser};
+
+use crate::constraint_system::{BlindingInfo, ConstraintSystemPadded};
 
 pub const SECURITY_BITS: usize = 96;
 
@@ -71,6 +69,16 @@ pub struct MulcheckOutput<F> {
 	pub r_x: Vec<F>,
 }
 
+/// IOP verifier for a particular constraint system.
+///
+/// This struct encapsulates the constraint system, providing the core verification logic
+/// independent of the specific IOP compilation strategy. Most users should use [`Verifier`]
+/// instead, which wraps this with a BaseFold compiler.
+#[derive(Debug, Clone)]
+pub struct IOPVerifier {
+	constraint_system: ConstraintSystemPadded,
+}
+
 /// Struct for verifying instances of a particular constraint system.
 ///
 /// The [`Self::setup`] constructor determines public parameters for proving instances of the given
@@ -82,123 +90,45 @@ where
 	MerkleHash: Digest + BlockSizeUser,
 	MerkleCompress: PseudoCompressionFunction<Output<MerkleHash>, 2>,
 {
-	constraint_system: ConstraintSystemPadded,
-	/// Mask buffer dimensions (m_n, m_d) for the ZK mulcheck mask polynomial.
-	mask_dims: (usize, usize),
+	iop_verifier: IOPVerifier,
 	/// BaseFold ZK compiler for creating verifier channels.
 	basefold_compiler:
 		BaseFoldZKVerifierCompiler<F, BinaryMerkleTreeScheme<F, MerkleHash, MerkleCompress>>,
 }
 
-impl<F, MerkleHash, MerkleCompress> Verifier<F, MerkleHash, MerkleCompress>
-where
-	F: BinaryField,
-	MerkleHash: Digest + BlockSizeUser,
-	MerkleCompress: PseudoCompressionFunction<Output<MerkleHash>, 2>,
-	Output<MerkleHash>: DeserializeBytes,
-{
-	/// Constructs a verifier for a constraint system.
-	///
-	/// See [`Verifier`] struct documentation for details.
-	pub fn setup(
-		constraint_system: ConstraintSystem,
-		log_inv_rate: usize,
-		compression: MerkleCompress,
-	) -> Result<Self, Error> {
-		// Modify the constraint system for zero-knowledge.
-		let n_fri_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
-		let blinding_info = BlindingInfo {
-			n_dummy_wires: n_fri_queries,
-			// TODO: Document why these are necessary
-			n_dummy_constraints: 2,
-		};
-		let constraint_system = ConstraintSystemPadded::new(constraint_system, blinding_info);
-
-		let log_witness_size = constraint_system.log_size() as usize;
-		let merkle_scheme = BinaryMerkleTreeScheme::new(compression);
-
-		let n_test_queries = calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
-
-		// Calculate mask buffer dimensions using the shared function.
-		let log_mul_constraints = checked_log_2(constraint_system.mul_constraints().len());
-		let mask_degree = 2; // quadratic composition
-		let mask_dims = mask_buffer_dimensions(log_mul_constraints, mask_degree, n_test_queries);
-		let (m_n, m_d) = mask_dims;
-		let log_mask_dim = m_n + m_d;
-
-		// Create a single NTT with the max domain size for both witness and mask.
-		let max_log_code_len = log_witness_size.max(log_mask_dim) + log_inv_rate;
-		let subspace = BinarySubspace::with_dim(max_log_code_len);
-		let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
-		let ntt = NeighborsLastSingleThread::new(domain_context);
-
-		// Create oracle specs for the IOP channel.
-		let oracle_specs = vec![
-			OracleSpec {
-				log_msg_len: log_witness_size,
-			},
-			OracleSpec {
-				log_msg_len: log_mask_dim,
-			},
-		];
-
-		// Create the BaseFold ZK compiler for IOP verification
-		let basefold_compiler = BaseFoldZKVerifierCompiler::new(
-			&ntt,
-			merkle_scheme,
-			oracle_specs,
-			log_inv_rate,
-			n_test_queries,
-			&MinProofSizeStrategy,
-		);
-
-		Ok(Self {
-			constraint_system,
-			mask_dims,
-			basefold_compiler,
-		})
+impl IOPVerifier {
+	/// Constructs an IOP verifier for a constraint system.
+	pub fn new(constraint_system: ConstraintSystemPadded) -> Self {
+		Self { constraint_system }
 	}
 
 	pub fn constraint_system(&self) -> &ConstraintSystemPadded {
 		&self.constraint_system
 	}
 
-	/// Returns a reference to the BaseFold ZK verifier compiler.
-	pub fn iop_compiler(
-		&self,
-	) -> &BaseFoldZKVerifierCompiler<F, BinaryMerkleTreeScheme<F, MerkleHash, MerkleCompress>> {
-		&self.basefold_compiler
-	}
+	/// Returns the oracle specs for the IOP channel.
+	///
+	/// These describe the oracles (witness and mask) that the prover commits to.
+	pub fn oracle_specs(&self) -> Vec<OracleSpec> {
+		let cs = &self.constraint_system;
+		let log_witness_size = cs.log_size() as usize;
+		let (m_n, m_d) = cs.mask_dims();
+		let log_mask_dim = m_n + m_d;
 
-	/// Returns the mask buffer dimensions (m_n, m_d) for the ZK mulcheck mask polynomial.
-	pub fn mask_dims(&self) -> (usize, usize) {
-		self.mask_dims
-	}
-
-	/// Verifies a proof against the constraint system.
-	///
-	/// # Arguments
-	///
-	/// * `public` - The public inputs to the constraint system
-	/// * `transcript` - The verifier transcript for Fiat-Shamir
-	///
-	/// # Preconditions
-	///
-	/// * The public input length must match the constraint system's public input size
-	pub fn verify<Challenger_: Challenger>(
-		&self,
-		public: &[F],
-		transcript: &mut VerifierTranscript<Challenger_>,
-	) -> Result<(), Error> {
-		// Create channel and delegate to verify_iop
-		let mut channel = self.basefold_compiler.create_channel(transcript);
-		self.verify_iop(public, &mut channel)
+		vec![
+			OracleSpec {
+				log_msg_len: log_witness_size,
+			},
+			OracleSpec {
+				log_msg_len: log_mask_dim,
+			},
+		]
 	}
 
 	/// Verifies a proof using an IOP channel.
 	///
-	/// This is an alternative interface for advanced users who want to provide their own
-	/// channel implementation. Most users should use [`Self::verify`] instead.
+	/// This is the core verification logic, independent of the specific IOP compilation strategy.
+	/// For most users, [`Verifier::verify`] is the simpler interface.
 	///
 	/// # Arguments
 	///
@@ -208,8 +138,9 @@ where
 	/// # Returns
 	///
 	/// `Ok(())` if the proof is valid, `Err(_)` otherwise.
-	pub fn verify_iop<Channel>(&self, public: &[F], channel: &mut Channel) -> Result<(), Error>
+	pub fn verify<F, Channel>(&self, public: &[F], channel: &mut Channel) -> Result<(), Error>
 	where
+		F: BinaryField,
 		Channel: IOPVerifierChannel<F>,
 		Channel::Elem: 'static,
 	{
@@ -217,12 +148,12 @@ where
 			tracing::info_span!("Verify", operation = "verify", perfetto_category = "operation")
 				.entered();
 
-		let cs = self.constraint_system();
+		let cs = &self.constraint_system;
 
 		// Check that the public input length is correct
 		if public.len() != 1 << cs.log_public() {
 			return Err(Error::IncorrectPublicInputLength {
-				expected: 1 << self.constraint_system.log_public(),
+				expected: 1 << cs.log_public(),
 				actual: public.len(),
 			});
 		}
@@ -243,7 +174,7 @@ where
 			c_eval,
 			mask_eval,
 			r_x,
-		} = self.verify_mulcheck(channel)?;
+		} = verify_mulcheck(cs, channel)?;
 
 		// Sample the public input check challenge and evaluate the public input at the challenge
 		// point.
@@ -252,17 +183,12 @@ where
 		let public_eval = evaluate_inplace_scalars(public_elems, &r_public);
 
 		// Compute wiring claim components
-		let wiring_claim = wiring::compute_claim(
-			&self.constraint_system,
-			&r_public,
-			&[a_eval, b_eval, c_eval],
-			public_eval,
-			channel,
-		);
+		let wiring_claim =
+			wiring::compute_claim(cs, &r_public, &[a_eval, b_eval, c_eval], public_eval, channel);
 
 		// Build the transparent closure for the wiring oracle relation
 		let trace_transparent = wiring::eval_transparent(
-			&self.constraint_system,
+			cs,
 			&r_public,
 			&r_x,
 			wiring_claim.lambda,
@@ -270,7 +196,7 @@ where
 		);
 
 		// Build the transparent closure for the mask oracle relation
-		let mask_transparent = self.mask_transparent(&r_x);
+		let mask_transparent = mask_transparent(cs, &r_x);
 
 		// Verify both oracle relations (checks are done inside verify_oracle_relations)
 		channel.verify_oracle_relations([
@@ -288,57 +214,142 @@ where
 
 		Ok(())
 	}
+}
 
-	fn verify_mulcheck<C>(&self, channel: &mut C) -> Result<MulcheckOutput<C::Elem>, Error>
-	where
-		C: IPVerifierChannel<F>,
-	{
-		let log_mul_constraints = checked_log_2(self.constraint_system.mul_constraints().len());
+impl<F, MerkleHash, MerkleCompress> Verifier<F, MerkleHash, MerkleCompress>
+where
+	F: BinaryField,
+	MerkleHash: Digest + BlockSizeUser,
+	MerkleCompress: PseudoCompressionFunction<Output<MerkleHash>, 2>,
+	Output<MerkleHash>: DeserializeBytes,
+{
+	/// Constructs a verifier for a constraint system.
+	///
+	/// See [`Verifier`] struct documentation for details.
+	pub fn setup(
+		constraint_system: ConstraintSystem,
+		log_inv_rate: usize,
+		compression: MerkleCompress,
+	) -> Result<Self, Error> {
+		// Modify the constraint system for zero-knowledge.
+		let n_test_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
+		let blinding_info = BlindingInfo {
+			n_dummy_wires: n_test_queries,
+			// TODO: Document why these are necessary
+			n_dummy_constraints: 2,
+		};
+		let constraint_system = ConstraintSystemPadded::new(constraint_system, blinding_info);
 
-		// Sample random evaluation point
-		let r_mulcheck = channel.sample_many(log_mul_constraints);
+		let iop_verifier = IOPVerifier::new(constraint_system);
+		let oracle_specs = iop_verifier.oracle_specs();
 
-		// Verify the zerocheck for the multiplication constraints.
-		let mlecheck::VerifyZKOutput {
-			eval,
-			mask_eval,
-			challenges: mut r_x,
-		} = mlecheck::verify_zk(&r_mulcheck, 2, C::Elem::zero(), channel)?;
+		let merkle_scheme = BinaryMerkleTreeScheme::new(compression);
 
-		// Reverse because sumcheck binds high-to-low variable indices.
-		r_x.reverse();
+		// Create the BaseFold ZK compiler for IOP verification
+		let basefold_compiler = BaseFoldZKVerifierCompiler::new(
+			merkle_scheme,
+			oracle_specs,
+			log_inv_rate,
+			n_test_queries,
+			&MinProofSizeStrategy,
+		);
 
-		// Read the claimed evaluations
-		let [a_eval, b_eval, c_eval] = channel.recv_array()?;
-
-		channel.assert_zero(a_eval.clone() * b_eval.clone() - c_eval.clone() - eval)?;
-
-		Ok(MulcheckOutput {
-			a_eval,
-			b_eval,
-			c_eval,
-			mask_eval,
-			r_x,
+		Ok(Self {
+			iop_verifier,
+			basefold_compiler,
 		})
 	}
 
-	/// Returns a closure that evaluates the mask transparent polynomial at a given point.
-	fn mask_transparent<E: FieldOps + 'static>(
+	/// Returns a reference to the IOP verifier.
+	pub fn iop_verifier(&self) -> &IOPVerifier {
+		&self.iop_verifier
+	}
+
+	pub fn constraint_system(&self) -> &ConstraintSystemPadded {
+		self.iop_verifier.constraint_system()
+	}
+
+	/// Returns a reference to the BaseFold ZK verifier compiler.
+	pub fn iop_compiler(
 		&self,
-		r_x: &[E],
-	) -> binius_iop::channel::TransparentEvalFn<E> {
-		let (_m_n, m_d) = self.mask_dims;
-		let n_vars = r_x.len();
-		let mask_degree = 2; // quadratic composition
-		let r_x = r_x.to_vec();
-
-		Box::new(move |point: &[E]| {
-			// Split into query_k (low-order bits) and query_j (high-order bits).
-			let (query_k, query_j) = point.split_at(m_d);
-
-			mlecheck::libra_eval(&r_x, query_j, query_k, n_vars, mask_degree)
-		})
+	) -> &BaseFoldZKVerifierCompiler<F, BinaryMerkleTreeScheme<F, MerkleHash, MerkleCompress>> {
+		&self.basefold_compiler
 	}
+
+	/// Verifies a proof against the constraint system.
+	///
+	/// # Arguments
+	///
+	/// * `public` - The public inputs to the constraint system
+	/// * `transcript` - The verifier transcript for Fiat-Shamir
+	///
+	/// # Preconditions
+	///
+	/// * The public input length must match the constraint system's public input size
+	pub fn verify<Challenger_: Challenger>(
+		&self,
+		public: &[F],
+		transcript: &mut VerifierTranscript<Challenger_>,
+	) -> Result<(), Error> {
+		// Create channel and delegate to IOPVerifier::verify
+		let mut channel = self.basefold_compiler.create_channel(transcript);
+		self.iop_verifier.verify(public, &mut channel)
+	}
+}
+
+fn verify_mulcheck<F, C>(
+	cs: &ConstraintSystemPadded,
+	channel: &mut C,
+) -> Result<MulcheckOutput<C::Elem>, Error>
+where
+	F: BinaryField,
+	C: IPVerifierChannel<F>,
+{
+	let log_mul_constraints = checked_log_2(cs.mul_constraints().len());
+
+	// Sample random evaluation point
+	let r_mulcheck = channel.sample_many(log_mul_constraints);
+
+	// Verify the zerocheck for the multiplication constraints.
+	let mlecheck::VerifyZKOutput {
+		eval,
+		mask_eval,
+		challenges: mut r_x,
+	} = mlecheck::verify_zk(&r_mulcheck, 2, C::Elem::zero(), channel)?;
+
+	// Reverse because sumcheck binds high-to-low variable indices.
+	r_x.reverse();
+
+	// Read the claimed evaluations
+	let [a_eval, b_eval, c_eval] = channel.recv_array()?;
+
+	channel.assert_zero(a_eval.clone() * b_eval.clone() - c_eval.clone() - eval)?;
+
+	Ok(MulcheckOutput {
+		a_eval,
+		b_eval,
+		c_eval,
+		mask_eval,
+		r_x,
+	})
+}
+
+/// Returns a closure that evaluates the mask transparent polynomial at a given point.
+fn mask_transparent<E: FieldOps + 'static>(
+	cs: &ConstraintSystemPadded,
+	r_x: &[E],
+) -> binius_iop::channel::TransparentEvalFn<E> {
+	let (_m_n, m_d) = cs.mask_dims();
+	let n_vars = r_x.len();
+	let mask_degree = 2; // quadratic composition
+	let r_x = r_x.to_vec();
+
+	Box::new(move |point: &[E]| {
+		// Split into query_k (low-order bits) and query_j (high-order bits).
+		let (query_k, query_j) = point.split_at(m_d);
+
+		mlecheck::libra_eval(&r_x, query_j, query_k, n_vars, mask_degree)
+	})
 }
 
 #[derive(Debug, thiserror::Error)]
