@@ -1,13 +1,18 @@
 // Copyright 2025 Irreducible Inc.
 
 use binius_core::{constraint_system::ConstraintSystem, word::Word};
-use binius_field::{AESTowerField8b as B8, BinaryField, ExtensionField};
+use binius_field::{AESTowerField8b as B8, BinaryField, ExtensionField, Field};
 use binius_iop::{
 	basefold_compiler::BaseFoldVerifierCompiler,
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
 };
 use binius_ip::channel::IPVerifierChannel;
-use binius_math::{BinarySubspace, inner_product::inner_product, univariate::lagrange_evals};
+use binius_math::{
+	BinarySubspace, FieldSlice,
+	inner_product::inner_product,
+	multilinear::{eq::eq_ind, evaluate::evaluate},
+	univariate::lagrange_evals,
+};
 use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
 use binius_utils::{
 	DeserializeBytes,
@@ -152,17 +157,6 @@ where
 		public: &[Word],
 		transcript: &mut VerifierTranscript<Challenger_>,
 	) -> Result<(), Error> {
-		// Check that the public input length is correct
-		if public.len() != 1 << self.log_public_words() {
-			return Err(Error::IncorrectPublicInputLength {
-				expected: 1 << self.log_public_words(),
-				actual: public.len(),
-			});
-		}
-
-		// Verifier observes the public input (includes it in Fiat-Shamir).
-		transcript.observe().write_slice(public);
-
 		// Create channel and delegate to verify_iop
 		let mut channel = self.iop_compiler.create_channel(transcript);
 		self.verify_iop(public, &mut channel)
@@ -172,6 +166,19 @@ where
 	where
 		Channel: IOPVerifierChannel<B128, Elem = B128>,
 	{
+		// Check that the public input length is correct
+		if public.len() != 1 << self.log_public_words() {
+			return Err(Error::IncorrectPublicInputLength {
+				expected: 1 << self.log_public_words(),
+				actual: public.len(),
+			});
+		}
+
+		let public_elems = encode_public(public);
+
+		// Verifier observes the public input (includes it in Fiat-Shamir).
+		channel.observe_many(&public_elems);
+
 		let _verify_guard =
 			tracing::info_span!("Verify", operation = "verify", perfetto_category = "operation")
 				.entered();
@@ -253,7 +260,7 @@ where
 		)
 		.entered();
 		let shift_output =
-			shift::verify(self.constraint_system(), public, &bitand_claim, &intmul_claim, channel)?;
+			shift::verify(self.constraint_system(), &bitand_claim, &intmul_claim, channel)?;
 		drop(constraint_guard);
 
 		// [phase] Verify Public Input - public input verification
@@ -287,18 +294,33 @@ where
 			sumcheck_claim,
 		} = ring_switch::verify(shift_output.witness_eval(), &eval_point, channel)?;
 
-		// Build the transparent closure for the ring-switching equality indicator
+		// Public input check batched with ring-switch
 		let log_packing = <B128 as ExtensionField<B1>>::LOG_DEGREE;
 		let eval_point_high = eval_point[log_packing..].to_vec();
+
+		let log_public_elems = self.log_public_words() - LOG_WORDS_PER_ELEM;
+		let pubcheck_point = eval_point_high[..log_public_elems].to_vec();
+		let pubcheck_claim = {
+			let public_elems_buf = FieldSlice::from_slice(log_public_elems, &public_elems);
+			evaluate(&public_elems_buf, &pubcheck_point)
+		};
+
+		let batch_coeff: B128 = channel.sample();
+		let batched_claim = sumcheck_claim + batch_coeff * pubcheck_claim;
+
+		// Build the transparent closure combining ring-switch and public input check
 		let transparent = Box::new(move |point: &[B128]| {
-			ring_switch::eval_rs_eq(&eval_point_high, point, eq_r_double_prime.as_ref())
+			let rs_eq_eval =
+				ring_switch::eval_rs_eq(&eval_point_high, point, eq_r_double_prime.as_ref());
+			let pubcheck_eq_eval = eval_pubcheck_eq(&pubcheck_point, point);
+			rs_eq_eval + batch_coeff * pubcheck_eq_eval
 		});
 
 		// Verify oracle relations (runs BaseFold internally and verifies the product check)
 		channel.verify_oracle_relations([OracleLinearRelation {
 			oracle: trace_oracle,
 			transparent,
-			claim: sumcheck_claim,
+			claim: batched_claim,
 		}])?;
 
 		drop(pcs_guard);
@@ -333,4 +355,31 @@ where
 		chain!(small_field_zerocheck_challenges, big_field_zerocheck_challenges)
 			.collect::<Vec<_>>();
 	verify_with_channel(&zerocheck_challenges, channel, eval_domain)
+}
+
+/// Evaluate the public input equality indicator at a query point.
+///
+/// Computes `eq(pubcheck_point || 0, query)`, which selects the first `2^k` entries of the
+/// committed polynomial (the public inputs). In characteristic 2:
+/// `eq(a || 0, x) = eq(a, x[..k]) * prod_{i >= k} (1 - x_i)`
+fn eval_pubcheck_eq(pubcheck_point: &[B128], query: &[B128]) -> B128 {
+	let (query_prefix, query_suffix) = query.split_at(pubcheck_point.len());
+	let prefix_eq = eq_ind(pubcheck_point, query_prefix);
+	let suffix_prod = query_suffix
+		.iter()
+		.fold(B128::ONE, |acc, &x| acc * (B128::ONE - x));
+	prefix_eq * suffix_prod
+}
+
+/// Encode public input words as B128 elements, for compliance with the IOP interface.
+fn encode_public(public: &[Word]) -> Vec<B128> {
+	let (word_pairs, remaining) = public.as_chunks::<2>();
+	assert!(
+		remaining.is_empty(),
+		"ValueVecLayout ensures the public section has a multiple of two number of words"
+	);
+	word_pairs
+		.iter()
+		.map(|[w0, w1]| B128::new(((w1.as_u64() as u128) << 64) | w0.as_u64() as u128))
+		.collect()
 }
