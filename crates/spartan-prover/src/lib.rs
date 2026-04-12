@@ -48,10 +48,13 @@ use binius_ip_prover::{
 };
 use binius_math::{
 	FieldBuffer, FieldSlice,
+	multilinear::eq::eq_ind_partial_eval,
 	ntt::{NeighborsLastMultiThread, domain_context::GenericPreExpanded},
 	univariate::evaluate_univariate,
 };
-use binius_spartan_frontend::constraint_system::{MulConstraint, Witness, WitnessIndex};
+use binius_spartan_frontend::constraint_system::{
+	MulConstraint, Witness, WitnessIndex, WitnessSegment,
+};
 use binius_spartan_verifier::{
 	Verifier,
 	constraint_system::{BlindingInfo, ConstraintSystemPadded},
@@ -82,7 +85,8 @@ type ProverMerkleProver<F, ParallelMerkleHasher, ParallelMerkleCompress> =
 #[derive(Debug)]
 pub struct IOPProver<F: Field> {
 	constraint_system: ConstraintSystemPadded<F>,
-	wiring_transpose: WiringTranspose,
+	precommit_wiring_transpose: WiringTranspose,
+	private_wiring_transpose: WiringTranspose,
 }
 
 /// Struct for proving instances of a particular constraint system.
@@ -108,13 +112,20 @@ where
 impl<F: Field> IOPProver<F> {
 	/// Constructs an IOP prover for a constraint system.
 	pub fn new(constraint_system: ConstraintSystemPadded<F>) -> Self {
-		let wiring_transpose = WiringTranspose::transpose(
+		let precommit_wiring_transpose = WiringTranspose::transpose(
+			WitnessSegment::Precommit,
+			constraint_system.precommit_size(),
+			constraint_system.mul_constraints(),
+		);
+		let private_wiring_transpose = WiringTranspose::transpose(
+			WitnessSegment::Private,
 			constraint_system.private_size(),
 			constraint_system.mul_constraints(),
 		);
 		Self {
 			constraint_system,
-			wiring_transpose,
+			precommit_wiring_transpose,
+			private_wiring_transpose,
 		}
 	}
 
@@ -152,6 +163,7 @@ impl<F: Field> IOPProver<F> {
 
 		// Check that the witness segments have the expected sizes
 		let expected_public_size = 1 << cs.log_public() as usize;
+		let expected_precommit_size = cs.precommit_size();
 		let expected_private_size = cs.private_size();
 		if witness.public().len() != expected_public_size {
 			return Err(Error::ArgumentError {
@@ -160,6 +172,16 @@ impl<F: Field> IOPProver<F> {
 					"public segment has {} elements, expected {}",
 					witness.public().len(),
 					expected_public_size
+				),
+			});
+		}
+		if witness.precommit().len() != expected_precommit_size {
+			return Err(Error::ArgumentError {
+				arg: "witness".to_string(),
+				msg: format!(
+					"precommit segment has {} elements, expected {}",
+					witness.precommit().len(),
+					expected_precommit_size
 				),
 			});
 		}
@@ -201,14 +223,25 @@ impl<F: Field> IOPProver<F> {
 			&mut rng,
 		);
 
-		// Send the private witness and masks oracles to the channel
-		let trace_oracle = channel.send_oracle(private_packed.to_ref());
+		// Pack precommit witness into field elements and add blinding
+		let precommit_packed = pack_and_blind_witness::<_, P>(
+			cs.log_precommit() as usize,
+			witness.precommit(),
+			cs.n_precommit() as usize,
+			blinding_info,
+			&mut rng,
+		);
+
+		// Send the precommit, private, and mask oracles to the channel
+		let precommit_oracle = channel.send_oracle(precommit_packed.to_ref());
+		let private_oracle = channel.send_oracle(private_packed.to_ref());
 		let mask_oracle = channel.send_oracle(masks_buffer.to_ref());
 
 		// Prove the multiplication constraints
 		let (mulcheck_evals, mask_eval, r_x) = prove_mulcheck::<F, P, _>(
 			cs.mul_constraints(),
 			witness.public(),
+			precommit_packed.to_ref(),
 			private_packed.to_ref(),
 			mulcheck_mask,
 			&mut channel,
@@ -220,28 +253,42 @@ impl<F: Field> IOPProver<F> {
 		// Batch together the constraint operand evaluation claims.
 		let batched_sum = evaluate_univariate(&mulcheck_evals, lambda);
 
+		// Compute eq indicator tensor for r_x (shared across all segment evaluations)
+		let r_x_tensor = eq_ind_partial_eval::<F>(&r_x);
+
 		// Compute rₓ^⊤ (M_A + λ M_B + λ² M_C) x
 		let public_eval = evaluate_wiring_mle_public(
 			cs.mul_constraints(),
-			cs.log_public() as usize,
 			witness.public(),
 			lambda,
-			&r_x,
+			r_x_tensor.as_ref(),
 		);
 
-		let trace_claim = batched_sum - public_eval;
+		// Compute the precommit segment's contribution to the wiring check.
+		// The prover sends this as a scalar; the oracle relation then verifies it.
+		let precommit_wiring_poly =
+			fold_constraints(&self.precommit_wiring_transpose, lambda, r_x_tensor.as_ref());
+		let precommit_claim = binius_math::inner_product::inner_product_buffers(
+			&precommit_packed.to_ref(),
+			&precommit_wiring_poly,
+		);
+		channel.send_one(precommit_claim);
 
-		// Fold constraints with batching and compute the folded polynomial
-		let wiring_poly = fold_constraints(&self.wiring_transpose, lambda, &r_x);
+		let private_claim = batched_sum - public_eval - precommit_claim;
+
+		// Fold private wiring constraints
+		let private_wiring_poly =
+			fold_constraints(&self.private_wiring_transpose, lambda, r_x_tensor.as_ref());
 
 		// Compute the mask folding polynomial (libra_eval tensor)
 		let n_vars = r_x.len();
 		let libra_eval_tensor =
 			zk_mlecheck::expand_libra_eval::<P>(&r_x, n_vars, mask_degree, m_n, m_d);
 
-		// Prove both oracle relations
+		// Prove all oracle relations
 		channel.prove_oracle_relations([
-			(trace_oracle, wiring_poly, trace_claim),
+			(precommit_oracle, precommit_wiring_poly, precommit_claim),
+			(private_oracle, private_wiring_poly, private_claim),
 			(mask_oracle, libra_eval_tensor, mask_eval),
 		]);
 
@@ -337,6 +384,7 @@ where
 fn prove_mulcheck<F, P, Channel>(
 	mul_constraints: &[MulConstraint<WitnessIndex>],
 	public: &[F],
+	precommit_packed: FieldSlice<P>,
 	private_packed: FieldSlice<P>,
 	mask: zk_mlecheck::Mask<P, impl Deref<Target = [P]>>,
 	channel: &mut Channel,
@@ -346,7 +394,8 @@ where
 	P: PackedField<Scalar = F> + PackedExtension<F>,
 	Channel: IPProverChannel<F>,
 {
-	let mulcheck_witness = wiring::build_mulcheck_witness(mul_constraints, public, private_packed);
+	let mulcheck_witness =
+		wiring::build_mulcheck_witness(mul_constraints, public, precommit_packed, private_packed);
 
 	// Sample random evaluation point for mulcheck
 	let r_mulcheck = channel.sample_many(mask.n_vars());
@@ -381,7 +430,7 @@ where
 	Ok((mulcheck_evals, mask_eval, r_x))
 }
 
-/// Packs private witness values into a [`FieldBuffer`] and adds blinding values for dummy wires.
+/// Packs witness values into a [`FieldBuffer`] and adds blinding values for dummy wires.
 fn pack_and_blind_witness<F: Field, P: PackedField<Scalar = F>>(
 	log_private: usize,
 	private: &[F],
