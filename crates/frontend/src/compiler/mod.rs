@@ -1,7 +1,6 @@
 // Copyright 2025-2026 The Binius Developers
 // Copyright 2025 Irreducible Inc.
 use std::{
-	array,
 	cell::{RefCell, RefMut},
 	rc::Rc,
 };
@@ -13,6 +12,10 @@ use crate::compiler::{
 	circuit::Circuit,
 	constraint_builder::ConstraintBuilder,
 	gate_graph::{GateGraph, WireKind},
+	hints::{
+		BigUintDivideHint, BigUintModPowHint, Hint, HintRegistry, ModInverseHint,
+		Secp256k1EndosplitHint,
+	},
 	pathspec::PathSpec,
 };
 
@@ -69,6 +72,7 @@ pub(crate) struct Shared {
 	pub(crate) graph: GateGraph,
 	pub(crate) opts: Options,
 	pub(crate) force_committed: EntitySet<Wire>,
+	pub(crate) hint_registry: HintRegistry,
 }
 
 /// Circuit builder for constructing zero-knowledge proof circuits.
@@ -181,6 +185,7 @@ impl CircuitBuilder {
 				graph,
 				opts,
 				force_committed: EntitySet::new(),
+				hint_registry: HintRegistry::new(),
 			}))),
 		}
 	}
@@ -202,11 +207,11 @@ impl CircuitBuilder {
 		};
 		let mut graph = shared.graph;
 
-		graph.validate();
+		graph.validate(&shared.hint_registry);
 
 		// Run constant propagation optimization
 		if shared.opts.enable_constant_propagation {
-			let replaced = const_prop::constant_propagation(&mut graph);
+			let replaced = const_prop::constant_propagation(&mut graph, &shared.hint_registry);
 			if replaced > 0 {
 				eprintln!("Constant propagation: replaced {} wires with constants", replaced);
 			}
@@ -272,8 +277,8 @@ impl CircuitBuilder {
 			cs.validate().unwrap();
 		}
 
-		// Build evaluation form
-		let eval_form = eval_form::EvalForm::build(&graph, &wire_mapping);
+		// Build evaluation form (consumes the hint registry the user populated via call_hint).
+		let eval_form = eval_form::EvalForm::build(&graph, &wire_mapping, shared.hint_registry);
 
 		Circuit::new(graph, cs, wire_mapping, eval_form)
 	}
@@ -1085,6 +1090,51 @@ impl CircuitBuilder {
 		out
 	}
 
+	/// Invoke a [`Hint`] and emit the corresponding gate.
+	///
+	/// Registers `hint` in the builder's hint registry (idempotent, keyed by `T::NAME`),
+	/// allocates output wires according to `hint.shape(dimensions)`, and emits a
+	/// generic hint gate. Returns the freshly allocated output wires.
+	///
+	/// `dimensions` is passed verbatim to [`Hint::shape`] and [`Hint::execute`]; it is the
+	/// hint's parameterization (e.g., limb counts for a bignum hint).
+	///
+	/// # Panics
+	///
+	/// Panics if `inputs.len()` does not match the hint's declared input arity.
+	pub fn call_hint<T: Hint>(&self, hint: T, dimensions: &[usize], inputs: &[Wire]) -> Vec<Wire> {
+		let (n_in, n_out) = hint.shape(dimensions);
+		assert_eq!(
+			inputs.len(),
+			n_in,
+			"call_hint: input arity mismatch for hint {} (expected {}, got {})",
+			T::NAME,
+			n_in,
+			inputs.len(),
+		);
+
+		let hint_id = self
+			.shared
+			.borrow_mut()
+			.as_mut()
+			.expect("CircuitBuilder used after build")
+			.hint_registry
+			.register(hint);
+
+		let outputs: Vec<Wire> = (0..n_out).map(|_| self.add_internal()).collect();
+
+		let mut graph = self.graph_mut();
+		graph.emit_hint_gate(
+			self.current_path,
+			hint_id,
+			dimensions,
+			inputs.iter().copied(),
+			outputs.iter().copied(),
+		);
+
+		outputs
+	}
+
 	/// BigUint division.
 	///
 	/// Returns `(quotient, remainder)` of the division of `dividend` by `divisor`.
@@ -1097,25 +1147,11 @@ impl CircuitBuilder {
 		dividend: &[Wire],
 		divisor: &[Wire],
 	) -> (Vec<Wire>, Vec<Wire>) {
-		let quotient = (0..dividend.len())
-			.map(|_| self.add_internal())
-			.collect::<Vec<_>>();
-
-		let remainder = (0..divisor.len())
-			.map(|_| self.add_internal())
-			.collect::<Vec<_>>();
-
-		let mut graph = self.graph_mut();
-		graph.emit_gate_generic(
-			self.current_path,
-			Opcode::BigUintDivideHint,
-			dividend.iter().chain(divisor).copied(),
-			quotient.iter().chain(&remainder).copied(),
-			&[dividend.len(), divisor.len()],
-			&[],
-		);
-
-		(quotient, remainder)
+		let inputs: Vec<Wire> = dividend.iter().chain(divisor).copied().collect();
+		let mut out =
+			self.call_hint(BigUintDivideHint::new(), &[dividend.len(), divisor.len()], &inputs);
+		let remainder = out.split_off(dividend.len());
+		(out, remainder)
 	}
 
 	/// Modular exponentiation.
@@ -1124,21 +1160,8 @@ impl CircuitBuilder {
 	/// This is a hint - a deterministic computation that happens only on the prover side.
 	/// The result should be additionally constrained using bignum circuits.
 	pub fn biguint_mod_pow_hint(&self, base: &[Wire], exp: &[Wire], modulus: &[Wire]) -> Vec<Wire> {
-		let modpow = (0..modulus.len())
-			.map(|_| self.add_internal())
-			.collect::<Vec<_>>();
-
-		let mut graph = self.graph_mut();
-		graph.emit_gate_generic(
-			self.current_path,
-			Opcode::BigUintModPowHint,
-			base.iter().chain(exp).chain(modulus).copied(),
-			modpow.iter().copied(),
-			&[base.len(), exp.len(), modulus.len()],
-			&[],
-		);
-
-		modpow
+		let inputs: Vec<Wire> = base.iter().chain(exp).chain(modulus).copied().collect();
+		self.call_hint(BigUintModPowHint::new(), &[base.len(), exp.len(), modulus.len()], &inputs)
 	}
 
 	/// Modular inverse.
@@ -1151,25 +1174,10 @@ impl CircuitBuilder {
 	/// The result should be additionally constrained by using bignum circuits to check that
 	/// `base * inverse = 1 + quotient * modulus`.
 	pub fn mod_inverse_hint(&self, base: &[Wire], modulus: &[Wire]) -> (Vec<Wire>, Vec<Wire>) {
-		let quotient = (0..modulus.len())
-			.map(|_| self.add_internal())
-			.collect::<Vec<_>>();
-
-		let inverse = (0..modulus.len())
-			.map(|_| self.add_internal())
-			.collect::<Vec<_>>();
-
-		let mut graph = self.graph_mut();
-		graph.emit_gate_generic(
-			self.current_path,
-			Opcode::ModInverseHint,
-			base.iter().chain(modulus).copied(),
-			quotient.iter().chain(&inverse).copied(),
-			&[base.len(), modulus.len()],
-			&[],
-		);
-
-		(quotient, inverse)
+		let inputs: Vec<Wire> = base.iter().chain(modulus).copied().collect();
+		let mut out = self.call_hint(ModInverseHint::new(), &[base.len(), modulus.len()], &inputs);
+		let inverse = out.split_off(modulus.len());
+		(out, inverse)
 	}
 
 	/// Secp256k1 endomorphism split
@@ -1195,27 +1203,10 @@ impl CircuitBuilder {
 		k: &[Wire],
 	) -> (Wire, Wire, [Wire; 2], [Wire; 2]) {
 		assert_eq!(k.len(), 4);
-
-		let k1_neg = self.add_internal();
-		let k2_neg = self.add_internal();
-
-		let k1_abs = array::from_fn(|_| self.add_internal());
-		let k2_abs = array::from_fn(|_| self.add_internal());
-
-		let mut graph = self.graph_mut();
-		graph.emit_gate_generic(
-			self.current_path,
-			Opcode::Secp256k1EndosplitHint,
-			k.iter().copied(),
-			[k1_neg, k2_neg]
-				.iter()
-				.chain(&k1_abs)
-				.chain(&k2_abs)
-				.copied(),
-			&[],
-			&[],
-		);
-
-		(k1_neg, k2_neg, k1_abs, k2_abs)
+		let out = self.call_hint(Secp256k1EndosplitHint::new(), &[], k);
+		let [k1_neg, k2_neg, k1_abs0, k1_abs1, k2_abs0, k2_abs1] = out.as_slice() else {
+			panic!("Secp256k1EndosplitHint must return 6 wires");
+		};
+		(*k1_neg, *k2_neg, [*k1_abs0, *k1_abs1], [*k2_abs0, *k2_abs1])
 	}
 }

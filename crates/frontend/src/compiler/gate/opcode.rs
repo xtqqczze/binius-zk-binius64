@@ -44,11 +44,11 @@ pub enum Opcode {
 	AssertTrue,
 	AssertEqCond,
 
-	// Hints
-	BigUintDivideHint,
-	BigUintModPowHint,
-	ModInverseHint,
-	Secp256k1EndosplitHint,
+	/// Generic hint gate. The hint's [`HintId`](crate::compiler::hints::HintId) is stored in
+	/// `immediates[0]` and the user dimensions (passed to
+	/// [`Hint::shape`](crate::compiler::hints::Hint::shape) /
+	/// [`Hint::execute`](crate::compiler::hints::Hint::execute)) are `&dimensions`.
+	Hint,
 }
 
 /// The shape of an opcode is a description of it's inputs and outputs. It allows treating a gate as
@@ -95,6 +95,7 @@ impl Opcode {
 			// Bitwise operations
 			Opcode::Band => gate::band::shape(),
 			Opcode::Bxor => gate::bxor::shape(),
+			// TODO: Can we get rid of this gate? This is the only non-hint one with dimensions
 			Opcode::BxorMulti => gate::bxor_multi::shape(dimensions),
 			Opcode::Bor => gate::bor::shape(),
 			Opcode::Fax => gate::fax::shape(),
@@ -132,20 +133,17 @@ impl Opcode {
 			Opcode::AssertEqCond => gate::assert_eq_cond::shape(),
 
 			// Hints (no constraints)
-			Opcode::BigUintDivideHint => gate::biguint_divide_hint::shape(dimensions),
-			Opcode::BigUintModPowHint => gate::biguint_mod_pow_hint::shape(dimensions),
-			Opcode::ModInverseHint => gate::mod_inverse_hint::shape(dimensions),
-			Opcode::Secp256k1EndosplitHint => gate::secp256k1_endosplit_hint::shape(),
+			Opcode::Hint => {
+				panic!("Opcode::Hint shape requires the HintRegistry; use GateData::shape instead")
+			}
 		}
 	}
 
 	pub fn is_const_shape(&self) -> bool {
 		#[allow(clippy::match_like_matches_macro)]
 		match self {
-			Opcode::BigUintDivideHint => false,
-			Opcode::BigUintModPowHint => false,
-			Opcode::ModInverseHint => false,
 			Opcode::BxorMulti => false,
+			Opcode::Hint => false,
 			_ => true,
 		}
 	}
