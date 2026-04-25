@@ -33,8 +33,11 @@ where
 {
 	inner_channel: BaseFoldZKVerifierChannel<'a, F, MTScheme, Challenger_>,
 	outer_verifier: &'a IOPVerifier<F>,
+	precommit_oracle: BaseFoldZKOracle,
 	public_values: Vec<F>,
-	n_outer_oracles: usize,
+	/// Number of outer oracles still to be received on `inner_channel` after inner verification
+	/// completes (i.e. the outer verifier's non-precommit oracles — private and mask).
+	n_outer_suffix_oracles: usize,
 }
 
 impl<'a, F, MTScheme, Challenger_> ZKWrappedVerifierChannel<'a, F, MTScheme, Challenger_>
@@ -45,47 +48,57 @@ where
 {
 	/// Creates a new ZK-wrapped verifier channel.
 	///
-	/// The outer verifier's oracle specs must be a suffix of the inner channel's oracle specs.
+	/// The outer verifier's oracle specs are expected to straddle the inner channel specs:
+	/// the outer precommit spec is at position 0 (committed before any inner interaction), and
+	/// the remaining outer specs (private, mask) form a suffix that will be received after the
+	/// inner verification completes. `new` receives the outer precommit oracle from the inner
+	/// channel and stores the handle for use in [`Self::finish`].
 	///
 	/// # Panics
 	///
-	/// Panics if the outer oracle specs are not a suffix of the channel's oracle specs.
+	/// Panics if the channel's oracle specs do not match the expected layout
+	/// `[outer_precommit, inner..., outer_private, outer_mask]`.
 	pub fn new(
-		inner_channel: BaseFoldZKVerifierChannel<'a, F, MTScheme, Challenger_>,
+		mut inner_channel: BaseFoldZKVerifierChannel<'a, F, MTScheme, Challenger_>,
 		outer_verifier: &'a IOPVerifier<F>,
-	) -> Self {
+	) -> Result<Self, Error> {
 		let outer_oracle_specs = outer_verifier.oracle_specs();
 		let channel_oracle_specs = inner_channel.remaining_oracle_specs();
 
 		let n_outer = outer_oracle_specs.len();
 		let n_total = channel_oracle_specs.len();
 		assert!(
-			n_outer <= n_total,
-			"outer oracle specs ({n_outer}) exceed channel oracle specs ({n_total})"
+			n_outer >= 1 && n_outer <= n_total,
+			"outer oracle specs ({n_outer}) exceed channel oracle specs ({n_total}) or are empty"
+		);
+		assert_eq!(
+			channel_oracle_specs[0], outer_oracle_specs[0],
+			"outer precommit oracle spec must be the first spec on the channel"
+		);
+		let suffix_len = n_outer - 1;
+		assert_eq!(
+			&channel_oracle_specs[n_total - suffix_len..],
+			&outer_oracle_specs[1..],
+			"outer private/mask oracle specs must be the final suffix of channel specs"
 		);
 
-		let suffix = &channel_oracle_specs[n_total - n_outer..];
-		assert_eq!(
-			suffix, &outer_oracle_specs,
-			"outer oracle specs must be a suffix of channel oracle specs"
-		);
+		let precommit_oracle = inner_channel.recv_oracle()?;
 
 		let outer_public_size = 1 << outer_verifier.constraint_system().log_public();
-		Self {
+		Ok(Self {
 			inner_channel,
 			outer_verifier,
+			precommit_oracle,
 			public_values: Vec::with_capacity(outer_public_size),
-			n_outer_oracles: n_outer,
-		}
+			n_outer_suffix_oracles: suffix_len,
+		})
 	}
 
 	/// Consumes the channel and runs the outer verifier.
 	///
 	/// Prepends the outer constraint system's constants to the recorded public values, pads to
 	/// the required public size, and runs [`IOPVerifier::verify`] against the inner channel.
-	///
-	/// Returns the full public input vector on success.
-	pub fn finish(mut self) -> Result<Vec<F>, Error> {
+	pub fn finish(mut self) -> Result<(), Error> {
 		let outer_cs = self.outer_verifier.constraint_system();
 		let public_size = 1 << outer_cs.log_public();
 
@@ -93,14 +106,10 @@ where
 		public.append(&mut self.public_values);
 		public.resize(public_size, F::ZERO);
 
-		// TODO(BINIUS-33 follow-up): Lift precommit oracle reception up to
-		// ZKWrappedVerifierChannel::new so the handle is captured at construction time.
-		let precommit_oracle = self.inner_channel.recv_oracle()?;
-
 		// IOPVerifier::verify takes Vec<Channel::Elem>, not &[F].
 		self.outer_verifier
-			.verify(precommit_oracle, public.clone(), &mut self.inner_channel)?;
-		Ok(public)
+			.verify(self.precommit_oracle, public, &mut self.inner_channel)?;
+		Ok(())
 	}
 }
 
@@ -119,18 +128,6 @@ where
 		Ok(val)
 	}
 
-	fn recv_many(&mut self, n: usize) -> Result<Vec<F>, binius_ip::channel::Error> {
-		let vals = self.inner_channel.recv_many(n)?;
-		self.public_values.extend_from_slice(&vals);
-		Ok(vals)
-	}
-
-	fn recv_array<const N: usize>(&mut self) -> Result<[F; N], binius_ip::channel::Error> {
-		let vals = self.inner_channel.recv_array::<N>()?;
-		self.public_values.extend_from_slice(&vals);
-		Ok(vals)
-	}
-
 	fn sample(&mut self) -> F {
 		let val = self.inner_channel.sample();
 		self.public_values.push(val);
@@ -141,12 +138,6 @@ where
 		let elem = self.inner_channel.observe_one(val);
 		self.public_values.push(elem);
 		elem
-	}
-
-	fn observe_many(&mut self, vals: &[F]) -> Vec<F> {
-		let elems = self.inner_channel.observe_many(vals);
-		self.public_values.extend_from_slice(&elems);
-		elems
 	}
 
 	fn assert_zero(&mut self, _val: F) -> Result<(), binius_ip::channel::Error> {
@@ -166,7 +157,7 @@ where
 
 	fn remaining_oracle_specs(&self) -> &[OracleSpec] {
 		let all = self.inner_channel.remaining_oracle_specs();
-		let n_remaining_inner = all.len() - self.n_outer_oracles;
+		let n_remaining_inner = all.len() - self.n_outer_suffix_oracles;
 		&all[..n_remaining_inner]
 	}
 
@@ -182,6 +173,16 @@ where
 		&mut self,
 		oracle_relations: impl IntoIterator<Item = OracleLinearRelation<'b, Self::Oracle, Self::Elem>>,
 	) -> Result<(), binius_iop::channel::Error> {
+		let oracle_relations = oracle_relations
+			.into_iter()
+			.map(|relation| {
+				let decrypted_claim = self.recv_one()?;
+				Ok(OracleLinearRelation {
+					claim: decrypted_claim,
+					..relation
+				})
+			})
+			.collect::<Result<Vec<_>, binius_iop::channel::Error>>()?;
 		self.inner_channel.verify_oracle_relations(oracle_relations)
 	}
 }
