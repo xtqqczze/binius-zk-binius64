@@ -1,6 +1,6 @@
 // Copyright 2024-2025 Irreducible Inc.
 
-use std::{iter, marker::PhantomData};
+use std::marker::PhantomData;
 
 use binius_field::{BinaryField, Field};
 use binius_math::{ntt::DomainContext, reed_solomon::ReedSolomonCode};
@@ -26,7 +26,6 @@ pub struct FRIParams<F> {
 	#[getset(get = "pub")]
 	rs_code: ReedSolomonCode<F>,
 	/// Guaranteed to be non-empty.
-	#[allow(unused)]
 	input_oracles: Vec<OracleSpec>,
 	/// log2 the maximum message length of all input oracles.
 	max_log_msg_len: usize,
@@ -249,6 +248,11 @@ where
 		&self.fold_arities
 	}
 
+	/// The specifications of the input oracles batched into the first-round FRI oracle.
+	pub fn input_oracles(&self) -> &[OracleSpec] {
+		&self.input_oracles
+	}
+
 	/// The arity of the reduction to the first round oracle.
 	pub fn log_batch_size(&self) -> usize {
 		self.log_msg_len() - self.rs_code().log_dim()
@@ -308,23 +312,6 @@ where
 			(log_batch_size, fold_arities)
 		}
 	}
-}
-
-/// This layer allows minimizing the proof size.
-pub fn vcs_optimal_layers_depths_iter<'a, F, VCS>(
-	fri_params: &'a FRIParams<F>,
-	vcs: &'a VCS,
-) -> impl Iterator<Item = usize> + 'a
-where
-	VCS: MerkleTreeScheme<F>,
-	F: BinaryField,
-{
-	iter::once(fri_params.log_batch_size())
-		.chain(fri_params.fold_arities().iter().copied())
-		.scan(fri_params.log_len(), |log_n_cosets, arity| {
-			*log_n_cosets -= arity;
-			Some(vcs.optimal_verify_layer(fri_params.n_test_queries(), *log_n_cosets))
-		})
 }
 
 struct ChooseBatchSizeAndAritiesOutput {

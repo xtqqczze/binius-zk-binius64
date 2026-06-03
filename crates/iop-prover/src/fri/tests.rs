@@ -1,28 +1,29 @@
 // Copyright 2024-2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use std::vec;
+use std::{iter, vec};
 
 use binius_field::{
-	BinaryField, BinaryField128bGhash as B128, PackedBinaryGhash1x128b, PackedField,
+	BinaryField, BinaryField128bGhash as B128, Field, PackedBinaryGhash1x128b, PackedField,
 };
 use binius_hash::{StdDigest, StdHashSuite};
-use binius_iop::fri::{self, FRIFoldVerifier, FRIParams, verify::FRIQueryVerifier};
+use binius_iop::fri::{
+	self, FRIFoldVerifier, FRIParams, PartialOracleSpec, verify::FRIQueryVerifier,
+};
 use binius_math::{
 	BinarySubspace, ReedSolomonCode,
-	multilinear::evaluate::evaluate,
-	ntt::{NeighborsLastSingleThread, domain_context::GenericOnTheFly},
+	multilinear::{eq::eq_ind_partial_eval_scalars, evaluate::evaluate},
+	ntt::{AdditiveNTT, NeighborsLastSingleThread, domain_context::GenericOnTheFly},
 	test_utils::{Packed128b, random_field_buffer},
 };
 use binius_transcript::{
 	ProverTranscript,
 	fiat_shamir::{CanSample, HasherChallenger},
 };
-use binius_utils::checked_arithmetics::log2_strict_usize;
 use rand::prelude::*;
 
 use super::{CommitOutput, FRIFoldProver, FoldRoundOutput, commit_interleaved};
-use crate::merkle_tree::{MerkleTreeProver, prover::BinaryMerkleTreeProver};
+use crate::merkle_tree::prover::BinaryMerkleTreeProver;
 
 type StdChallenger = HasherChallenger<StdDigest>;
 
@@ -71,7 +72,7 @@ fn test_commit_prove_verify_success<F, P>(
 
 	// Note: The prover does an initial fold round before receiving any challenges
 	// This is round 0, which won't produce a commitment when log_batch_size > 0
-	let fold_round_output = round_prover.execute_fold_round().unwrap();
+	let fold_round_output = round_prover.execute_fold_round();
 	if let FoldRoundOutput::Commitment(round_commitment) = fold_round_output {
 		prover_challenger.message().write(&round_commitment);
 	}
@@ -80,7 +81,7 @@ fn test_commit_prove_verify_success<F, P>(
 		let challenge = prover_challenger.sample();
 		round_prover.receive_challenge(challenge);
 
-		let fold_round_output = round_prover.execute_fold_round().unwrap();
+		let fold_round_output = round_prover.execute_fold_round();
 		if let FoldRoundOutput::Commitment(round_commitment) = fold_round_output {
 			prover_challenger.message().write(&round_commitment);
 		}
@@ -124,35 +125,16 @@ fn test_commit_prove_verify_success<F, P>(
 	)
 	.unwrap();
 
-	let mut cloned_verifier_challenger = verifier_challenger.clone();
-
-	let terminate_codeword_len =
-		1 << (params.n_final_challenges() + params.rs_code().log_inv_rate());
-
-	let mut advice = verifier_challenger.decommitment();
-	let terminate_codeword: Vec<F> = advice.read_scalar_slice(terminate_codeword_len).unwrap();
-
-	let log_batch_size =
-		log2_strict_usize(terminate_codeword.len()).saturating_sub(params.rs_code().log_inv_rate());
-
-	let (commitment, tree) = merkle_prover
-		.commit(&terminate_codeword, 1 << log_batch_size)
-		.unwrap();
-
-	// Ensure that the terminate_codeword commitment is correct
-	let last_round_commitment = round_commitments.last().unwrap_or(&codeword_commitment);
-	assert_eq!(*last_round_commitment, commitment.root);
-
-	// Verify that the Merkle tree has exactly inv_rate leaves.
-	assert_eq!(tree.log_len, params.rs_code().log_inv_rate());
-
+	// The verifier checks the terminal codeword against its commitment internally (the terminal
+	// codeword is sent in full at the end of the query phase).
+	//
 	// check c == t(r'_0, ..., r'_{\ell-1})
 	// note that the prover is claiming that the final_message is [c]
 	let mut eval_point = verifier_challenges.clone();
 	eval_point.reverse();
 	let computed_eval = evaluate(&msg, &eval_point);
 
-	let final_fri_value = verifier.verify(&mut cloned_verifier_challenger).unwrap();
+	let final_fri_value = verifier.verify(&mut verifier_challenger).unwrap();
 	assert_eq!(computed_eval, final_fri_value);
 }
 
@@ -232,6 +214,147 @@ fn test_commit_prove_verify_success_without_folding() {
 	);
 }
 
+/// Full FRI round trip that batches several initial oracles in the first fold.
+///
+/// The three input oracles share the same Reed-Solomon code (dimension and inverse rate) but have
+/// differing batch sizes (1, 1, 2). The prover commits each interleaved codeword separately, folds
+/// and combines them into a single first-round codeword via [`FRIFoldProver::new_batch`], and the
+/// verifier reconstructs the same combined oracle via [`FRIQueryVerifier::new_batch`].
+#[test]
+fn test_commit_prove_verify_batched_multi_oracle() {
+	type F = B128;
+	type P = PackedBinaryGhash1x128b;
+
+	let mut rng = StdRng::seed_from_u64(0);
+
+	let log_dim = 8;
+	let log_inv_rate = 2;
+	let log_batch_sizes = [1usize, 1, 2];
+	let n_test_queries = 3;
+
+	let merkle_prover = BinaryMerkleTreeProver::<F, StdHashSuite>::new();
+
+	// The reduced Reed-Solomon code is shared by every input oracle, so the domain only needs to
+	// cover its length.
+	let subspace = BinarySubspace::with_dim(log_dim + log_inv_rate);
+	let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+	let ntt = NeighborsLastSingleThread::new(domain_context);
+
+	// Each oracle has RS dimension `log_dim`, hence message length `log_dim + log_batch_size`.
+	// Fixing every batch size forces the reduced (first-round) dimension to `log_dim`.
+	let oracle_specs = log_batch_sizes
+		.iter()
+		.map(|&log_batch_size| PartialOracleSpec {
+			log_msg_len: log_dim + log_batch_size,
+			log_batch_size: Some(log_batch_size),
+		})
+		.collect::<Vec<_>>();
+	let (params, _proof_size) = FRIParams::<F>::optimal_for_batch(
+		ntt.domain_context(),
+		merkle_prover.scheme(),
+		&oracle_specs,
+		log_inv_rate,
+		n_test_queries,
+	);
+	assert_eq!(params.rs_code().log_dim(), log_dim);
+
+	// Commit each input oracle's interleaved codeword separately.
+	let mut messages = Vec::new();
+	let mut commitments = Vec::new();
+	let mut committeds = Vec::new();
+	let mut codewords = Vec::new();
+	for &log_batch_size in &log_batch_sizes {
+		let oracle_params =
+			FRIParams::new(params.rs_code().clone(), log_batch_size, vec![], n_test_queries)
+				.unwrap();
+		let msg = random_field_buffer::<P>(&mut rng, log_dim + log_batch_size);
+		let CommitOutput {
+			commitment,
+			committed,
+			codeword,
+		} = commit_interleaved(&oracle_params, &ntt, &merkle_prover, msg.to_ref()).unwrap();
+		messages.push(msg);
+		commitments.push(commitment);
+		committeds.push(committed);
+		codewords.push(codeword);
+	}
+
+	// Run the prover: write the per-oracle codeword commitments, then fold.
+	let committed_codewords = iter::zip(codewords, &committeds).collect::<Vec<_>>();
+	let mut round_prover =
+		FRIFoldProver::new_batch(&params, &ntt, &merkle_prover, committed_codewords).unwrap();
+
+	let mut prover_challenger = ProverTranscript::new(StdChallenger::default());
+	for commitment in &commitments {
+		prover_challenger.message().write(commitment);
+	}
+
+	let fold_round_output = round_prover.execute_fold_round();
+	if let FoldRoundOutput::Commitment(round_commitment) = fold_round_output {
+		prover_challenger.message().write(&round_commitment);
+	}
+	for _ in 0..params.n_fold_rounds() {
+		let challenge = prover_challenger.sample();
+		round_prover.receive_challenge(challenge);
+
+		let fold_round_output = round_prover.execute_fold_round();
+		if let FoldRoundOutput::Commitment(round_commitment) = fold_round_output {
+			prover_challenger.message().write(&round_commitment);
+		}
+	}
+	round_prover.finish_proof(&mut prover_challenger).unwrap();
+
+	// Run the verifier.
+	let mut verifier_challenger = prover_challenger.into_verifier();
+	let read_commitments = commitments
+		.iter()
+		.map(|_| verifier_challenger.message().read().unwrap())
+		.collect::<Vec<_>>();
+
+	let mut verifier_challenges = Vec::with_capacity(params.n_fold_rounds());
+	let mut fri_fold_verifier = FRIFoldVerifier::new(&params);
+	fri_fold_verifier
+		.process_round(&mut verifier_challenger.message())
+		.unwrap();
+	for _ in 0..params.n_fold_rounds() {
+		verifier_challenges.push(verifier_challenger.sample());
+		fri_fold_verifier
+			.process_round(&mut verifier_challenger.message())
+			.unwrap();
+	}
+	let round_commitments = fri_fold_verifier.finalize().unwrap();
+
+	let verifier = FRIQueryVerifier::new_batch(
+		&params,
+		merkle_prover.scheme(),
+		&read_commitments,
+		&round_commitments,
+		&verifier_challenges,
+	)
+	.unwrap();
+	let final_value = verifier.verify(&mut verifier_challenger).unwrap();
+
+	// The first fold reduces oracle `i` by its inner challenges (the last `log_batch_size_i` of the
+	// first `max_log_batch_size` challenges) and combines the oracles with the outer-challenge
+	// tensor. The remaining (tail) challenges fold the shared reduced codeword. So the final value
+	// is   sum_i outer_tensor[i] * evaluate(msg_i, reversed(inner_i ++ tail)).
+	let max_log_batch_size = log_batch_sizes.iter().copied().max().unwrap();
+	let first_fold_arity = params.log_batch_size();
+	let inner = &verifier_challenges[..max_log_batch_size];
+	let outer = &verifier_challenges[max_log_batch_size..first_fold_arity];
+	let tail = &verifier_challenges[first_fold_arity..];
+	let outer_tensor = eq_ind_partial_eval_scalars::<F>(outer);
+
+	let mut expected = F::ZERO;
+	for (i, (msg, &log_batch_size)) in iter::zip(&messages, &log_batch_sizes).enumerate() {
+		let inner_i = &inner[max_log_batch_size - log_batch_size..];
+		let mut eval_point = inner_i.iter().chain(tail).copied().collect::<Vec<_>>();
+		eval_point.reverse();
+		expected += outer_tensor[i] * evaluate(msg, &eval_point);
+	}
+	assert_eq!(final_value, expected);
+}
+
 /// Runs the FRI prover and returns the proof bytes along with the FRI params and Merkle scheme,
 /// so the caller can check the estimated proof size.
 fn generate_fri_proof<F, P>(
@@ -273,7 +396,7 @@ where
 	let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
 	prover_transcript.message().write(&codeword_commitment);
 
-	let fold_round_output = round_prover.execute_fold_round().unwrap();
+	let fold_round_output = round_prover.execute_fold_round();
 	if let FoldRoundOutput::Commitment(round_commitment) = fold_round_output {
 		prover_transcript.message().write(&round_commitment);
 	}
@@ -282,7 +405,7 @@ where
 		let challenge = prover_transcript.sample();
 		round_prover.receive_challenge(challenge);
 
-		let fold_round_output = round_prover.execute_fold_round().unwrap();
+		let fold_round_output = round_prover.execute_fold_round();
 		if let FoldRoundOutput::Commitment(round_commitment) = fold_round_output {
 			prover_transcript.message().write(&round_commitment);
 		}
