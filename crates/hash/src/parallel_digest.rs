@@ -1,7 +1,7 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use std::{array, mem::MaybeUninit};
+use std::{array, marker::PhantomData, mem::MaybeUninit};
 
 use binius_utils::{
 	SerializeBytes,
@@ -11,7 +11,7 @@ use binius_utils::{
 	},
 };
 use bytes::BytesMut;
-use digest::{Digest, Output, block_api::BlockSizeUser};
+use digest::{Digest, FixedOutputReset, Output, block_api::BlockSizeUser};
 
 use crate::HashBuffer;
 
@@ -72,9 +72,6 @@ pub trait ParallelDigest: Send {
 	/// Create new hasher instance with empty state.
 	fn new() -> Self;
 
-	/// Create new hasher instance which has processed the provided data.
-	fn new_with_prefix(data: impl AsRef<[u8]>) -> Self;
-
 	/// Calculate the digest of multiple hashes by processing a parallel iterator of iterators.
 	///
 	/// The source parameter provides a parallel iterator where:
@@ -109,10 +106,6 @@ impl<D: MultiDigest<N, Digest: Send> + Send + Sync, const N: usize> ParallelDige
 
 	fn new() -> Self {
 		Self(D::new())
-	}
-
-	fn new_with_prefix(data: impl AsRef<[u8]>) -> Self {
-		Self(D::new_with_prefix(data.as_ref()))
 	}
 
 	fn digest<I: IntoIterator<Item: SerializeBytes>>(
@@ -150,15 +143,28 @@ impl<D: MultiDigest<N, Digest: Send> + Send + Sync, const N: usize> ParallelDige
 	}
 }
 
-impl<D: Digest + BlockSizeUser + Send + Sync + Clone> ParallelDigest for D {
+/// Adapts a sequential [`Digest`] into a [`ParallelDigest`] that hashes one leaf per element of a
+/// parallel iterator.
+///
+/// Each Rayon work-item is seeded with a single hasher (via `for_each_with`) which is recycled in
+/// place with `finalize_reset` between leaves, rather than cloning a fresh hasher per leaf. This
+/// requires `D: FixedOutputReset`.
+pub struct ParallelDigestAdapter<D>(PhantomData<D>);
+
+impl<D> Default for ParallelDigestAdapter<D> {
+	fn default() -> Self {
+		Self(PhantomData)
+	}
+}
+
+impl<D> ParallelDigest for ParallelDigestAdapter<D>
+where
+	D: Digest + FixedOutputReset + BlockSizeUser + Send + Sync + Clone,
+{
 	type Digest = D;
 
 	fn new() -> Self {
-		Digest::new()
-	}
-
-	fn new_with_prefix(data: impl AsRef<[u8]>) -> Self {
-		Digest::new_with_prefix(data)
+		Self(PhantomData)
 	}
 
 	fn digest<I: IntoIterator<Item: SerializeBytes>>(
@@ -166,17 +172,18 @@ impl<D: Digest + BlockSizeUser + Send + Sync + Clone> ParallelDigest for D {
 		source: impl IndexedParallelIterator<Item = I>,
 		out: &mut [MaybeUninit<Output<Self::Digest>>],
 	) {
-		source.zip(out.par_iter_mut()).for_each(|(items, out)| {
-			let mut hasher = self.clone();
-			{
-				let mut buffer = HashBuffer::new(&mut hasher);
-				for item in items {
-					item.serialize(&mut buffer)
-						.expect("pre-condition: items must serialize without error")
+		source
+			.zip(out.par_iter_mut())
+			.for_each_with(D::new(), |hasher, (items, out)| {
+				{
+					let mut buffer = HashBuffer::new(hasher);
+					for item in items {
+						item.serialize(&mut buffer)
+							.expect("pre-condition: items must serialize without error")
+					}
 				}
-			}
-			out.write(hasher.finalize());
-		});
+				out.write(hasher.finalize_reset());
+			});
 	}
 }
 
@@ -303,17 +310,10 @@ mod tests {
 			.collect::<Vec<_>>();
 		parallel_digest.digest(data.par_iter(), &mut parallel_results);
 
-		let single_digest_as_parallel = <D::Digest as ParallelDigest>::new();
-		let mut single_results = repeat_with(MaybeUninit::<Output<D::Digest>>::uninit)
-			.take(data.len())
-			.collect::<Vec<_>>();
-		single_digest_as_parallel.digest(data.par_iter(), &mut single_results);
-
 		let serial_results = data.iter().map(<D::Digest as Digest>::digest);
 
-		for (parallel, single, serial) in izip!(parallel_results, single_results, serial_results) {
+		for (parallel, serial) in izip!(parallel_results, serial_results) {
 			assert_eq!(unsafe { parallel.assume_init() }, serial);
-			assert_eq!(unsafe { single.assume_init() }, serial);
 		}
 	}
 
@@ -328,6 +328,25 @@ mod tests {
 		for n_hashes in [1, 2, 4, 8, 9] {
 			let data = generate_mock_data(n_hashes, 16);
 			check_parallel_digest_consistency::<ParallelMultidigestImpl<MockMultiDigest, 4>>(data);
+		}
+	}
+
+	#[test]
+	fn test_adapter_matches_serial_sha256() {
+		use sha2::Sha256;
+
+		for n_hashes in [0, 1, 2, 4, 8, 9, 100] {
+			let data = generate_mock_data(n_hashes, 16);
+
+			let adapter = ParallelDigestAdapter::<Sha256>::new();
+			let mut results = repeat_with(MaybeUninit::<Output<Sha256>>::uninit)
+				.take(data.len())
+				.collect::<Vec<_>>();
+			adapter.digest(data.par_iter(), &mut results);
+
+			for (result, leaf) in results.into_iter().zip(&data) {
+				assert_eq!(unsafe { result.assume_init() }, <Sha256 as Digest>::digest(leaf));
+			}
 		}
 	}
 }
