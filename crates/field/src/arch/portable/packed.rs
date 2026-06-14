@@ -415,6 +415,52 @@ where
 	}
 }
 
+// A packed field divides into its scalars, mirroring how its underlier divides into the scalar's
+// underlier. This is the supertrait obligation behind `PackedField: Divisible<Self::Scalar>`.
+impl<U, Scalar> Divisible<Scalar> for PackedPrimitiveType<U, Scalar>
+where
+	U: UnderlierWithBitOps + Divisible<Scalar::Underlier>,
+	Scalar: BinaryField,
+{
+	const LOG_N: usize = (U::BITS / Scalar::N_BITS).ilog2() as usize;
+
+	#[inline]
+	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = Scalar> + Send + Clone {
+		Divisible::<Scalar::Underlier>::value_iter(value.0).map(Scalar::from_underlier)
+	}
+
+	#[inline]
+	fn ref_iter(value: &Self) -> impl ExactSizeIterator<Item = Scalar> + Send + Clone + '_ {
+		Divisible::<Scalar::Underlier>::ref_iter(&value.0).map(Scalar::from_underlier)
+	}
+
+	#[inline]
+	fn slice_iter(slice: &[Self]) -> impl ExactSizeIterator<Item = Scalar> + Send + Clone + '_ {
+		Divisible::<Scalar::Underlier>::slice_iter(Self::to_underliers_ref(slice))
+			.map(Scalar::from_underlier)
+	}
+
+	#[inline]
+	fn get(self, index: usize) -> Scalar {
+		Scalar::from_underlier(Divisible::<Scalar::Underlier>::get(self.0, index))
+	}
+
+	#[inline]
+	fn set(self, index: usize, val: Scalar) -> Self {
+		Divisible::<Scalar::Underlier>::set(self.0, index, val.to_underlier()).into()
+	}
+
+	#[inline]
+	fn broadcast(val: Scalar) -> Self {
+		<U as Divisible<Scalar::Underlier>>::broadcast(val.to_underlier()).into()
+	}
+
+	#[inline]
+	fn from_iter(iter: impl Iterator<Item = Scalar>) -> Self {
+		<U as Divisible<Scalar::Underlier>>::from_iter(iter.map(Scalar::to_underlier)).into()
+	}
+}
+
 impl<U, Scalar> PackedField for PackedPrimitiveType<U, Scalar>
 where
 	Self:
@@ -422,7 +468,8 @@ where
 	U: UnderlierWithBitOps + Divisible<Scalar::Underlier>,
 	Scalar: BinaryField,
 {
-	const LOG_WIDTH: usize = (U::BITS / Scalar::N_BITS).ilog2() as usize;
+	// LOG_WIDTH defaults to `<Self as Divisible<Scalar>>::LOG_N`, the same `(U::BITS /
+	// Scalar::N_BITS).ilog2()` count.
 
 	#[inline]
 	unsafe fn get_unchecked(&self, i: usize) -> Self::Scalar {
@@ -485,11 +532,6 @@ where
 				.spread::<<Self::Scalar as WithUnderlier>::Underlier>(log_block_len, block_idx)
 				.into()
 		}
-	}
-
-	#[inline]
-	fn broadcast(scalar: Self::Scalar) -> Self {
-		Self::broadcast(scalar)
 	}
 
 	#[inline]
