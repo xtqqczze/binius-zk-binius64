@@ -3,7 +3,7 @@
 
 use std::{
 	arch::x86_64::*,
-	array,
+	array, mem,
 	ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr},
 };
 
@@ -28,6 +28,12 @@ use crate::{
 	},
 };
 
+pub const fn m128i_from_u128(x: u128) -> __m128i {
+	// Static assertion that u128 and __m128i have equal alignment
+	let _: [(); align_of::<u128>()] = [(); align_of::<__m128i>()];
+	unsafe { mem::transmute(x) }
+}
+
 /// 128-bit value that is used for 128-bit SIMD operations
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -36,12 +42,7 @@ pub struct M128(pub(super) __m128i);
 impl M128 {
 	#[inline(always)]
 	pub const fn from_u128(val: u128) -> Self {
-		let mut result = Self::ZERO;
-		unsafe {
-			result.0 = std::mem::transmute_copy(&val);
-		}
-
-		result
+		Self(m128i_from_u128(val))
 	}
 }
 
@@ -54,11 +55,7 @@ impl From<__m128i> for M128 {
 
 impl From<u128> for M128 {
 	fn from(value: u128) -> Self {
-		Self(unsafe {
-			// Safety: u128 is 16-byte aligned
-			assert_eq!(align_of::<u128>(), 16);
-			_mm_load_si128(&raw const value as *const __m128i)
-		})
+		Self(m128i_from_u128(value))
 	}
 }
 
@@ -203,9 +200,9 @@ impl Not for M128 {
 	type Output = Self;
 
 	fn not(self) -> Self::Output {
-		const ONES: __m128i = m128_from_u128!(u128::MAX);
+		const ONES: M128 = M128::from_u128(u128::MAX);
 
-		self ^ Self(ONES)
+		self ^ ONES
 	}
 }
 
@@ -323,23 +320,11 @@ impl std::fmt::Debug for M128 {
 	}
 }
 
-#[repr(align(16))]
-pub struct AlignedData(pub [u128; 1]);
-
-macro_rules! m128_from_u128 {
-	($val:expr) => {{
-		let aligned_data = $crate::arch::x86_64::m128::AlignedData([$val]);
-		unsafe { *(aligned_data.0.as_ptr() as *const core::arch::x86_64::__m128i) }
-	}};
-}
-
-pub(super) use m128_from_u128;
-
 impl UnderlierType for M128 {
 	const LOG_BITS: usize = 7;
-	const ZERO: Self = { Self(m128_from_u128!(0)) };
-	const ONE: Self = { Self(m128_from_u128!(1)) };
-	const ONES: Self = { Self(m128_from_u128!(u128::MAX)) };
+	const ZERO: Self = { Self::from_u128(0) };
+	const ONE: Self = { Self::from_u128(1) };
+	const ONES: Self = { Self::from_u128(u128::MAX) };
 
 	#[inline(always)]
 	fn interleave(self, other: Self, log_block_len: usize) -> (Self, Self) {

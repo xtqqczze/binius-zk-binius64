@@ -1,8 +1,9 @@
 // Copyright 2024-2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
 use std::{
 	arch::x86_64::*,
-	mem::transmute,
+	mem,
 	ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr},
 };
 
@@ -15,6 +16,7 @@ use bytemuck::{Pod, Zeroable};
 use cfg_if::cfg_if;
 use rand::{distr::StandardUniform, prelude::*};
 
+use super::m128::{M128, m128i_from_u128};
 use crate::{
 	BinaryField,
 	arch::portable::packed::PackedPrimitiveType,
@@ -24,6 +26,28 @@ use crate::{
 	},
 };
 
+const fn u128_from_m128i(x: __m128i) -> u128 {
+	// Static assertion that u128 and __m128i have equal alignment
+	let _: [(); align_of::<u128>()] = [(); align_of::<__m128i>()];
+	unsafe { mem::transmute(x) }
+}
+
+const fn m256i_from_u128s(lo: u128, hi: u128) -> __m256i {
+	// TODO: use _mm256_set_m128i when const is stable
+	// See: https://github.com/rust-lang/rust/issues/149298
+
+	#[allow(unused)]
+	#[repr(align(32))]
+	struct Aligned2xm128i([__m128i; 2]);
+
+	// Static assertion that Aligned2xm128i and __m256i have equal alignment
+	let _: [(); align_of::<Aligned2xm128i>()] = [(); align_of::<__m256i>()];
+
+	let lo_m128i = m128i_from_u128(lo);
+	let hi_m128i = m128i_from_u128(hi);
+	unsafe { mem::transmute::<Aligned2xm128i, __m256i>(Aligned2xm128i([lo_m128i, hi_m128i])) }
+}
+
 /// 256-bit value that is used for 256-bit SIMD operations
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -31,7 +55,13 @@ pub struct M256(pub(super) __m256i);
 
 impl M256 {
 	pub const fn from_equal_u128s(val: u128) -> Self {
-		unsafe { transmute([val, val]) }
+		Self::from_u128s(val, val)
+	}
+
+	/// Builds an `M256` from its two 128-bit halves (`low` is the least-significant 128 bits) in a
+	/// `const` context.
+	pub const fn from_u128s(lo: u128, hi: u128) -> Self {
+		Self(m256i_from_u128s(lo, hi))
 	}
 }
 
@@ -91,11 +121,18 @@ impl<const N: usize> From<SmallU<N>> for M256 {
 	}
 }
 
+impl From<M128> for M256 {
+	fn from(value: M128) -> Self {
+		// Zero-extend the 128-bit value into the least-significant half.
+		Self::from([u128::from(value), 0])
+	}
+}
+
 impl From<M256> for [u128; 2] {
 	fn from(value: M256) -> Self {
-		let result: [u128; 2] = unsafe { transmute(value.0) };
-
-		result
+		let lo = unsafe { _mm256_extracti128_si256::<0>(value.0) };
+		let hi = unsafe { _mm256_extracti128_si256::<1>(value.0) };
+		[u128_from_m128i(lo), u128_from_m128i(hi)]
 	}
 }
 
@@ -140,6 +177,16 @@ impl<U: NumCast<u128>> NumCast<M256> for U {
 	fn num_cast_from(val: M256) -> Self {
 		let [low, _high] = val.into();
 		Self::num_cast_from(low)
+	}
+}
+
+// `M128` is not a `NumCast<u128>` type (so it is not covered by the blanket above), but the GHASH
+// subfield extraction for `GhashSq256b` needs to pull the low 128-bit half out as an `M128`.
+impl NumCast<M256> for M128 {
+	#[inline(always)]
+	fn num_cast_from(val: M256) -> Self {
+		let [low, _high]: [u128; 2] = val.into();
+		Self::from(low)
 	}
 }
 
@@ -203,9 +250,9 @@ impl Not for M256 {
 
 	#[inline(always)]
 	fn not(self) -> Self::Output {
-		const ONES: __m256i = m256_from_u128s!(u128::MAX, u128::MAX,);
+		const ONES: M256 = M256::from_u128s(u128::MAX, u128::MAX);
 
-		self ^ Self(ONES)
+		self ^ ONES
 	}
 }
 
@@ -281,6 +328,20 @@ impl Ord for M256 {
 	}
 }
 
+impl std::hash::Hash for M256 {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		<[u128; 2]>::from(*self).hash(state);
+	}
+}
+
+impl std::fmt::LowerHex for M256 {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// Most-significant 128 bits first, zero-padded to its full width.
+		let [low, high]: [u128; 2] = (*self).into();
+		write!(f, "{high:032x}{low:032x}")
+	}
+}
+
 impl Distribution<M256> for StandardUniform {
 	fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> M256 {
 		let val: [u128; 2] = rng.random();
@@ -301,25 +362,11 @@ impl std::fmt::Debug for M256 {
 	}
 }
 
-#[repr(align(32))]
-pub struct AlignedData(pub [u128; 2]);
-
-macro_rules! m256_from_u128s {
-    ($($values:expr,)+) => {{
-        let aligned_data = $crate::arch::x86_64::m256::AlignedData([$($values,)*]);
-        unsafe {* (aligned_data.0.as_ptr() as *const __m256i)}
-    }};
-}
-
-pub(super) use m256_from_u128s;
-
-use super::m128::M128;
-
 impl UnderlierType for M256 {
 	const LOG_BITS: usize = 8;
-	const ZERO: Self = { Self(m256_from_u128s!(0, 0,)) };
-	const ONE: Self = { Self(m256_from_u128s!(1, 0,)) };
-	const ONES: Self = { Self(m256_from_u128s!(u128::MAX, u128::MAX,)) };
+	const ZERO: Self = { Self::from_u128s(0, 0) };
+	const ONE: Self = { Self::from_u128s(1, 0) };
+	const ONES: Self = { Self::from_u128s(u128::MAX, u128::MAX) };
 
 	#[inline(always)]
 	unsafe fn spread<T>(self, log_block_len: usize, block_idx: usize) -> Self
@@ -824,7 +871,7 @@ cfg_if! {
 				}
 				block_idx += 1;
 			}
-			let mut m256_masks = [m256_from_u128s!(0, 0,); BLOCK_IDX_AMOUNT];
+			let mut m256_masks = [m256i_from_u128s(0, 0); BLOCK_IDX_AMOUNT];
 
 			let mut block_idx = 0;
 
@@ -839,7 +886,7 @@ cfg_if! {
 					}
 					i += 1;
 				}
-				m256_masks[block_idx] = m256_from_u128s!(u128s[0], u128s[1],);
+				m256_masks[block_idx] = m256i_from_u128s(u128s[0], u128s[1]);
 				block_idx += 1;
 			}
 
