@@ -367,7 +367,24 @@ fn compute_batched_transparent<P: PackedField<Scalar = B128>>(
 	rs_eq_ind
 }
 
-fn pack_witness<P: PackedField<Scalar = B128>>(
+/// Packs committed witness words into the field buffer committed as the trace oracle.
+///
+/// Two 64-bit words are packed little-endian into one 128-bit field element.
+/// The element sequence is zero-padded up to `2^log_witness_elems`.
+///
+/// # Arguments
+///
+/// - `log_witness_elems`: base-2 logarithm of the committed field-element count.
+/// - `witness`: the committed witness words, in value-vector order.
+///
+/// # Returns
+///
+/// The packed multilinear over `log_witness_elems` variables, ready to commit.
+///
+/// # Errors
+///
+/// Returns an error when the words do not fit in `2^log_witness_elems` field elements.
+pub fn pack_witness<P: PackedField<Scalar = B128>>(
 	log_witness_elems: usize,
 	witness: &[Word],
 ) -> Result<FieldBuffer<P>, Error> {
