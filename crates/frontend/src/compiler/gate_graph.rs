@@ -21,7 +21,7 @@ impl ConstPool {
 	}
 
 	pub fn get(&self, value: Word) -> Option<Wire> {
-		self.pool.get(&value).cloned()
+		self.pool.get(&value).copied()
 	}
 
 	pub fn insert(&mut self, word: Word, wire: Wire) {
