@@ -25,6 +25,7 @@ use gate::Opcode;
 pub mod circuit;
 pub mod const_prop;
 pub mod constraint_builder;
+mod dce;
 mod dump;
 pub mod eval_form;
 mod gate_fusion;
@@ -41,6 +42,7 @@ pub use gate_graph::Wire;
 pub(crate) struct Options {
 	enable_gate_fusion: bool,
 	enable_constant_propagation: bool,
+	enable_dead_code_elimination: bool,
 }
 
 // Shut up clippy since this is just so happens to be derivable for now.
@@ -50,6 +52,7 @@ impl Default for Options {
 		Self {
 			enable_gate_fusion: true,
 			enable_constant_propagation: false,
+			enable_dead_code_elimination: true,
 		}
 	}
 }
@@ -63,6 +66,9 @@ impl Options {
 		let mut opts = Self::default();
 		if std::env::var("MONBIJOU_CONSTPROP").is_ok() {
 			opts.enable_constant_propagation = true;
+		}
+		if std::env::var("BINIUS_DISABLE_DCE").is_ok() {
+			opts.enable_dead_code_elimination = false;
 		}
 		opts
 	}
@@ -217,8 +223,22 @@ impl CircuitBuilder {
 			}
 		}
 
+		// Dead-code elimination: the gates that can affect the constraint system.
+		// A gate outside this set emits no constraint and no committed wire, so it is skipped
+		// below.
+		let live_gates = shared
+			.opts
+			.enable_dead_code_elimination
+			.then(|| dce::live_gates(&mut graph, &shared.force_committed, &shared.hint_registry));
+
 		let mut builder = ConstraintBuilder::new();
 		for (gate_id, _) in graph.gates.iter() {
+			// Drop dead gates: they would only add constraints on wires that nothing reads.
+			if let Some(live_gates) = &live_gates
+				&& !live_gates.contains(gate_id)
+			{
+				continue;
+			}
 			gate::constrain(gate_id, &graph, &mut builder);
 		}
 

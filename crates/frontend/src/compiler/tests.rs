@@ -621,6 +621,10 @@ fn test_linear_constraint_conversion_to_and() {
 	let combined2 = builder.bxor(sar_result, rotr_result);
 	let final_result = builder.bxor(combined1, combined2);
 
+	// Pin the result as committed so its linear cone survives dead-code elimination.
+	// A computation read by nothing is otherwise dropped, leaving no AND constraint to check.
+	builder.force_commit(final_result);
+
 	let circuit = builder.build();
 
 	// Get the constraint system which should have AND constraints
