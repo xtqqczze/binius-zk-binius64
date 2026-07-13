@@ -93,6 +93,8 @@ where
 	let shift = shift::verify::<B128, _>(cs, &bitand, &intmul, channel)?;
 
 	// Tie in the shared constants through the public-input consistency check.
+	// The shift evaluates them over the layout's power-of-two word count.
+	// Their count need not be a power of two, so they are passed unpadded.
 	shift::check_eval::<B128, _>(
 		cs,
 		&cs.constants,

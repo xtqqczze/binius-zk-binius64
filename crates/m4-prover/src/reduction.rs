@@ -99,6 +99,8 @@ where
 
 	// Reduce the operand claims to one witness evaluation.
 	// No MUL constraints here, so the intmul claim is a zero claim at an empty point.
+	// The shift evaluates the constants over the layout's power-of-two word count.
+	// Their count need not be a power of two, so they are passed unpadded.
 	let witness_claim = prove_shift::<B128, P, _>(
 		key_collection,
 		&cs.constants,
@@ -127,8 +129,9 @@ where
 mod tests {
 	use std::array;
 
+	use binius_circuits::blake3::blake3_compress;
 	use binius_field::PackedBinaryGhash1x128b;
-	use binius_frontend::CircuitBuilder;
+	use binius_frontend::{CircuitBuilder, Wire};
 	use binius_m4_verifier::verify_reduction;
 	use binius_math::{inner_product::inner_product, multilinear::eq::eq_ind_partial_eval};
 	use binius_prover::protocols::shift::build_key_collection;
@@ -251,6 +254,71 @@ mod tests {
 					.expect_err("a tampered proof must not verify and finalize cleanly");
 			}
 		}
+	}
+
+	// Invariant: a circuit whose constant count is not a power of two proves and verifies.
+	// The shift evaluates the constants over the layout's power-of-two word count.
+	// It treats the words past the constant count as zero, so no caller padding is needed.
+	//
+	// Fixture: one BLAKE3 compression per instance, over 2^6 instances.
+	// A BLAKE3 compression is a real circuit with a non-power-of-two constant count.
+	#[test]
+	fn reduction_round_trips_with_non_power_of_two_constants() {
+		// One BLAKE3 compression; the output is force-committed so the circuit has no inout wires.
+		let builder = CircuitBuilder::new();
+		let cv: [Wire; 8] = array::from_fn(|_| builder.add_witness());
+		let block: [Wire; 16] = array::from_fn(|_| builder.add_witness());
+		let counter = builder.add_witness();
+		let block_len = builder.add_witness();
+		let flags = builder.add_witness();
+		let out = blake3_compress(&builder, cv, block, counter, block_len, flags);
+		for wire in out {
+			builder.force_commit(wire);
+		}
+		let circuit = builder.build();
+
+		let mut cs = circuit.constraint_system().clone();
+		cs.validate_and_prepare().unwrap();
+		// Confirm the fixture is genuine: the constant count is not a power of two.
+		assert!(!cs.constants.len().is_power_of_two());
+
+		// Fill each instance's inputs from a per-instance seed; the compression derives the rest.
+		let log_instances = 6;
+		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
+			let mut rng = StdRng::seed_from_u64(i as u64);
+			// A 32-bit value per chaining-value word.
+			for wire in cv {
+				w[wire] = Word(rng.next_u32() as u64);
+			}
+			// A 32-bit value per message word.
+			for wire in block {
+				w[wire] = Word(rng.next_u32() as u64);
+			}
+			// A full 64-bit block counter.
+			w[counter] = Word(rng.next_u64());
+			// A byte length in 0..=64.
+			w[block_len] = Word((rng.next_u32() % 65) as u64);
+			// Arbitrary domain-separation flags.
+			w[flags] = Word(rng.next_u32() as u64);
+		})
+		.unwrap();
+
+		// Setup: build the shift keys once.
+		let key_collection = build_key_collection(&cs);
+
+		// Prove the reduction on a fresh transcript.
+		let mut prover_transcript = ProverTranscript::<StdChallenger>::default();
+		let prover_out =
+			prove_reduction::<P, _>(&cs, &key_collection, &table, &mut prover_transcript);
+
+		// Verify by replaying the same transcript, leaving no trailing data.
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		let verifier_out = verify_reduction(&cs, log_instances, &mut verifier_transcript).unwrap();
+		verifier_transcript.finalize().unwrap();
+
+		// Both sides agree on the instance challenge and the reduced claim.
+		assert_eq!(prover_out.r_rho, verifier_out.r_rho);
+		assert_eq!(prover_out.witness_claim.eval, verifier_out.shift.witness_eval);
 	}
 
 	#[test]
