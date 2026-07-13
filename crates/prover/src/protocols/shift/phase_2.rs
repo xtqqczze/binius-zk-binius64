@@ -9,8 +9,7 @@ use binius_ip::sumcheck::{RoundCoeffs, SumcheckOutput};
 use binius_ip_prover::{
 	channel::IPProverChannel,
 	sumcheck::{
-		ProveSingleOutput, bivariate_product::BivariateProductSumcheckProver, prove_single,
-		round_evals::RoundEvals2,
+		ProveSingleOutput, bivariate_product_prover, prove_single, round_evals::RoundEvals2,
 	},
 };
 use binius_math::{
@@ -193,9 +192,9 @@ fn fold_segments<F: Field, P: PackedField<Scalar = F>>(
 /// The witness `W` and monster `M` are each given as a (public, hidden) segment pair; the top
 /// word-index variable selects the segment. The first round (`first_round_coeffs`) binds that
 /// selector without materializing the mostly-zero combined buffers. After the selector challenge
-/// the segment pairs fold into single dense buffers (`fold_segments`) and the standard
-/// [`BivariateProductSumcheckProver`] proves the remaining rounds, so every round message is
-/// identical to the dense prover's.
+/// the segment pairs fold into single dense buffers (`fold_segments`) and the standard shared
+/// bivariate-product prover (`bivariate_product_prover`) proves the remaining rounds, so every
+/// round message is identical to the dense prover's.
 ///
 /// After the sumcheck this derives the witness evaluation from the combined evaluation by
 /// evaluating the public segment (cheap, like the verifier does), subtracting its padded
@@ -235,7 +234,7 @@ where
 	// standard prover.
 	let folded_witness = fold_segments(&public_folded, hidden_folded, alpha);
 	let folded_monster = fold_segments(&public_monster, hidden_monster, alpha);
-	let prover = BivariateProductSumcheckProver::new([folded_witness, folded_monster], round_sum);
+	let prover = bivariate_product_prover([folded_witness, folded_monster], round_sum);
 
 	let ProveSingleOutput {
 		multilinear_evals,

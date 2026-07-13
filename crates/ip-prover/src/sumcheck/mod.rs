@@ -2,7 +2,6 @@
 // Copyright 2026 The Binius Developers
 
 pub mod batch;
-pub mod bivariate_product;
 pub mod bivariate_product_evaluator;
 pub mod bivariate_product_mle;
 pub mod bivariate_product_multi_mle;
@@ -24,6 +23,7 @@ pub mod round_evaluator;
 mod round_state;
 pub mod selector_mle;
 mod switchover;
+pub use bivariate_product_evaluator::bivariate_product_prover;
 pub use mle_to_sumcheck::*;
 pub use padded::*;
 pub use prove::*;
