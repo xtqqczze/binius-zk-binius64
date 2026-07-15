@@ -86,9 +86,9 @@ where
 	///
 	/// The trace oracle is not ZK, so the channel masks nothing and needs no randomness.
 	///
-	/// # Panics
-	///
-	/// Panics if the constraint system has any MUL constraints.
+	/// With MUL constraints the reduction commits one further oracle: the IntMul logup*
+	/// pushforward. The IntMul check queues that oracle's opening itself.
+	/// The final combined FRI opening covers it alongside the trace, so it needs no handling here.
 	pub fn prove<Challenger_>(
 		&self,
 		table: &ValueTable,
@@ -154,6 +154,7 @@ mod tests {
 
 	use assert_matches::assert_matches;
 	use binius_field::PackedBinaryGhash1x128b;
+	use binius_frontend::CircuitBuilder;
 	use binius_iop::{
 		basefold::{Error as BaseFoldError, VerificationError as BaseFoldVerificationError},
 		channel::Error as IOPChannelError,
@@ -197,6 +198,64 @@ mod tests {
 		let prover = Prover::<P>::setup(&verifier);
 
 		// Prover: commit, reduce, and open on a fresh transcript.
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		prover.prove(&table, &mut prover_transcript);
+
+		// Verifier: replay the same transcript end to end.
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		verifier
+			.verify(&mut verifier_transcript)
+			.expect("a faithful proof verifies");
+		verifier_transcript
+			.finalize()
+			.expect("no trailing proof data");
+	}
+
+	// A circuit carrying MUL constraints round-trips through the whole protocol.
+	//
+	// With MUL constraints the proof commits two oracles rather than one:
+	//
+	//     trace oracle    : the packed batch witness
+	//     logup* oracle   : the IntMul check's pushforward
+	//
+	// The IntMul and AND checks reduce to different instance points, which the re-randomization
+	// unifies before the witness is folded.
+	//
+	// Fixture: one unsigned 64x64 -> 128 product per instance over 2^6 instances, both product
+	// words force-committed. The `imul` gate emits one MUL constraint and one AND security check.
+	//
+	// A faithful proof verifies, both oracles open, and no trailing data is left.
+	#[test]
+	fn protocol_round_trips_with_mul() {
+		// One product per instance, with both result words committed as hidden words.
+		let builder = CircuitBuilder::new();
+		let x = builder.add_witness();
+		let y = builder.add_witness();
+		let (hi, lo) = builder.imul(x, y);
+		builder.force_commit(hi);
+		builder.force_commit(lo);
+		let circuit = builder.build();
+
+		let mut cs = circuit.constraint_system().clone();
+		cs.validate_and_prepare().unwrap();
+		// Confirm the fixture genuinely exercises the IntMul path.
+		assert!(!cs.mul_constraints.is_empty(), "the fixture must emit a MUL constraint");
+
+		// Fill each instance's two multiplicands from a per-instance seed; the circuit derives the
+		// two product words.
+		let log_instances = 6;
+		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
+			let mut rng = StdRng::seed_from_u64(i as u64);
+			w[x] = Word(rng.next_u64());
+			w[y] = Word(rng.next_u64());
+		})
+		.unwrap();
+
+		// Setup once: the verifier fixes the shape and FRI parameters, the prover inherits them.
+		let verifier = Verifier::setup(&cs, log_instances, 1);
+		let prover = Prover::<P>::setup(&verifier);
+
+		// Prover: commit both oracles, reduce, and open on a fresh transcript.
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
 		prover.prove(&table, &mut prover_transcript);
 

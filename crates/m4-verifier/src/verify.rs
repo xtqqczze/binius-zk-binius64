@@ -14,6 +14,7 @@ use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
 use binius_verifier::{
 	Error,
 	config::{B1, B128},
+	protocols::intmul::common::LIMB_BITS,
 	ring_switch::{self, RingSwitchVerifyOutput},
 };
 
@@ -59,9 +60,19 @@ impl Verifier {
 		// The committed shape follows from one instance's length and the instance count.
 		let layout = BatchCommitLayout::for_constraint_system(cs, log_instances);
 
-		// One oracle: the packed batch witness, committed without zero-knowledge.
+		// The packed batch witness, committed without zero-knowledge.
 		// ZK-ness is a higher-level choice that M4 does not make here.
-		let oracle_specs = vec![OracleSpec::new(layout.log_witness_elems)];
+		let mut oracle_specs = vec![OracleSpec::new(layout.log_witness_elems)];
+
+		// With MUL constraints the IntMul check commits one further oracle: its logup* pushforward.
+		// The pushforward spans the generator-power table, so its size is fixed by the table alone.
+		// It is independent of the instance and constraint counts.
+		// It is committed after the trace, so it follows the trace in the spec order.
+		// This spec must stay in sync with the oracle the IntMul check commits
+		// (`logup_star::verify` receives one oracle of `LIMB_BITS` variables).
+		if !cs.mul_constraints.is_empty() {
+			oracle_specs.push(OracleSpec::new(LIMB_BITS));
+		}
 
 		// Pick the proof-size-optimal FRI fold arity for this codeword length.
 		let log_code_len = layout.log_witness_elems + log_inv_rate;
