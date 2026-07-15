@@ -27,8 +27,6 @@
 //! 1. **Carry generation constraint**: Ensures correct carry propagation
 //! 2. **Sum constraint**: Ensures the sum equals `a ^ b ^ (cout << 1) ^ cin_msb`
 
-use binius_core::word::Word;
-
 use crate::compiler::{
 	constraint_builder::{ConstraintBuilder, sll, srl, xor3, xor4},
 	gate::opcode::OpcodeShape,
@@ -37,7 +35,7 @@ use crate::compiler::{
 
 pub const fn shape() -> OpcodeShape {
 	OpcodeShape {
-		const_in: &[Word::ALL_ONE],
+		const_in: &[],
 		n_in: 3,
 		n_out: 2,
 		n_aux: 0,

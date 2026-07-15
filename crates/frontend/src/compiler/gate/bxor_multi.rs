@@ -8,8 +8,6 @@
 //! The gate generates 1 linear constraint:
 //! - `x0 ⊕ x1 ⊕ ... ⊕ xn = z`
 
-use binius_core::word::Word;
-
 use crate::compiler::{
 	constraint_builder::{ConstraintBuilder, WireExprTerm, xor_multi},
 	gate::opcode::OpcodeShape,
@@ -21,7 +19,7 @@ pub fn shape(dimensions: &[usize]) -> OpcodeShape {
 		unreachable!()
 	};
 	OpcodeShape {
-		const_in: &[Word::ALL_ONE],
+		const_in: &[],
 		n_in: *n_inputs,
 		n_out: 1,
 		n_aux: 0,

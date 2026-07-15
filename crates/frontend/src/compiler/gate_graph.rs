@@ -655,21 +655,25 @@ mod tests {
 		let mut graph = GateGraph::new();
 		let root = graph.path_spec_tree.root();
 
-		let in1 = graph.add_inout();
-		let in2 = graph.add_inout();
-		let out = graph.add_witness();
+		let a = graph.add_inout();
+		let b = graph.add_inout();
+		let bin = graph.add_inout();
+		let diff = graph.add_witness();
+		let bout = graph.add_witness();
 
-		let gate = graph.emit_gate(root, Opcode::Bxor, vec![in1, in2], vec![out]);
+		// IsubBinBout declares one constant input (ALL_ONE) alongside its three regular inputs.
+		let gate = graph.emit_gate(root, Opcode::IsubBinBout, vec![a, b, bin], vec![diff, bout]);
 
 		// No need to rebuild use-def chains for this test
 		// as we're just checking the gate structure
 
 		let inputs = get_gate_inputs(&graph, gate);
-		// Bxor has 1 constant input (ALL_ONE) + 2 regular inputs
-		assert_eq!(inputs.len(), 3);
-		assert!(inputs.contains(&in1));
-		assert!(inputs.contains(&in2));
-		// First input should be the constant wire
+		// 1 constant input (ALL_ONE) + 3 regular inputs.
+		assert_eq!(inputs.len(), 4);
+		assert!(inputs.contains(&a));
+		assert!(inputs.contains(&b));
+		assert!(inputs.contains(&bin));
+		// The constant wire is surfaced first.
 		let const_wire = inputs[0];
 		match graph.wires[const_wire].kind {
 			WireKind::Constant(word) => assert_eq!(word, Word::ALL_ONE),
@@ -677,7 +681,8 @@ mod tests {
 		}
 
 		let outputs = get_gate_outputs(&graph, gate);
-		assert_eq!(outputs.len(), 1);
-		assert!(outputs.contains(&out));
+		assert_eq!(outputs.len(), 2);
+		assert!(outputs.contains(&diff));
+		assert!(outputs.contains(&bout));
 	}
 }
