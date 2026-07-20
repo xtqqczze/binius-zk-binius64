@@ -477,15 +477,20 @@ where
 	}
 
 	fn round_claim(&self) -> Vec<F> {
-		// The claim is held directly before this round's polynomial is produced, and afterwards
-		// recovered from that prime polynomial as the eq-lerp of its endpoints at the round
-		// coordinate — the highest remaining coordinate of the shared point.
-		let alpha = self.eval_point[self.n_vars() - 1];
+		// Before a round's polynomial is produced, the claim is held directly.
+		// Afterwards it is recovered from the prime polynomial as the eq-lerp of its endpoints.
+		// The lerp coordinate is the highest remaining coordinate of the shared point.
+		// It is read only in the post-execute state.
+		// That state is gone once every variable is folded.
+		// This method therefore stays valid to call at zero remaining variables.
 		self.round_states
 			.iter()
 			.map(|state| match state {
 				RoundState::Claim(claim) => *claim,
-				RoundState::Coeffs(coeffs) => coeffs.lerp_over_endpoints(alpha),
+				RoundState::Coeffs(coeffs) => {
+					let alpha = self.eval_point[self.n_vars() - 1];
+					coeffs.lerp_over_endpoints(alpha)
+				}
 			})
 			.collect()
 	}

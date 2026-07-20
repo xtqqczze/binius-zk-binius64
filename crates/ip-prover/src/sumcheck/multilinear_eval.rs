@@ -3,129 +3,127 @@
 
 use binius_field::{Field, PackedField, WideMul};
 use binius_ip::sumcheck::RoundCoeffs;
-use binius_math::{FieldBuffer, multilinear::fold::fold_highest_var_inplace};
-use binius_utils::rayon::prelude::*;
+use binius_math::{FieldBuffer, FieldSlice};
 
 use super::{
-	common::{MleCheckProver, SumcheckProver},
-	gruen32::Gruen32,
+	mle_store::{ColId, EvaluationChunk, MleStore},
 	round_evals::RoundEvals1,
-	round_state::RoundState,
+	round_evaluator::{MleCheckRoundEvaluator, SharedMleCheckProver},
 };
 
-/// An [`MleCheckProver`] for the multilinear extension evaluation of a single multilinear
-/// polynomial over the challenge field.
+/// MLE-check round evaluator for the multilinear evaluation of one store column.
 ///
-/// Given a multilinear polynomial $M$ over the field $F$ and a claim $M(z) = s$, this proves the
-/// MLE-check relation $s = \sum_{v \in B_n} M(v) \cdot \text{eq}(v, z)$ (which, since $M$ is
-/// multilinear, holds iff $M(z) = s$). It handles a single multilinear over the large field $F$.
-///
-/// Because $M$ is multilinear, each round polynomial is degree 1. The prover folds the witness with
-/// each challenge, and in each round computes the round polynomial's evaluation at 1 by taking the
-/// top half of the folded witness (the partial specialization at the highest variable = 1) and
-/// dotting it with the [`Gruen32`] equality-indicator expansion over the remaining variables.
-#[derive(Debug, Clone)]
-pub struct MultilinearEvalProver<P: PackedField> {
-	witness: FieldBuffer<P>,
-	gruen32: Gruen32<P>,
-	last_coeffs_or_sum: RoundState<RoundCoeffs<P::Scalar>, P::Scalar>,
+/// The composition is the identity.
+/// Each round polynomial is therefore degree 1, with a single sampled evaluation.
+/// That evaluation is the inner product of the column's `X = 1` half with the round's eq chunk.
+/// The driving [`SharedMleCheckProver`] supplies that chunk.
+/// It folds the higher eq coordinates through its own reduction step.
+/// No full-width eq tensor is ever materialized, streamed, or folded.
+pub struct MultilinearEvalEvaluator {
+	col: ColId,
 }
 
-impl<F: Field, P: PackedField<Scalar = F>> MultilinearEvalProver<P> {
-	/// Constructs a prover for the multilinear `witness`, given the evaluation point `eval_point`
-	/// and the claimed evaluation `eval_claim` of the multilinear extension at that point.
-	///
-	/// Panics if the witness length does not match the evaluation point length.
-	pub fn new(witness: FieldBuffer<P>, eval_point: &[F], eval_claim: F) -> Self {
-		assert_eq!(
-			witness.log_len(),
-			eval_point.len(),
-			"witness must have number of variables equal to the evaluation point length"
-		);
-
-		Self {
-			witness,
-			gruen32: Gruen32::new(eval_point),
-			last_coeffs_or_sum: RoundState::Claim(eval_claim),
-		}
+impl MultilinearEvalEvaluator {
+	/// Creates an evaluator over the store column `col`.
+	pub const fn new(col: ColId) -> Self {
+		Self { col }
 	}
 }
 
-impl<F: Field, P: PackedField<Scalar = F>> SumcheckProver<F> for MultilinearEvalProver<P> {
-	fn n_vars(&self) -> usize {
-		self.gruen32.n_vars_remaining()
-	}
-
-	fn n_claims(&self) -> usize {
+impl<F, P> MleCheckRoundEvaluator<F, P> for MultilinearEvalEvaluator
+where
+	F: Field,
+	P: PackedField<Scalar = F>,
+{
+	fn degree(&self) -> usize {
+		// Identity composition: the round polynomial is degree 1.
+		// One sampled evaluation suffices.
 		1
 	}
 
-	fn round_claim(&self) -> Vec<F> {
-		let claim = match &self.last_coeffs_or_sum {
-			RoundState::Claim(sum) => *sum,
-			RoundState::Coeffs(coeffs) => {
-				coeffs.lerp_over_endpoints(self.gruen32.next_coordinate())
-			}
-		};
-		vec![claim]
+	fn accumulate(
+		&self,
+		chunk: &EvaluationChunk<'_, P>,
+		eq_ind: FieldSlice<'_, P>,
+		accum: &mut [<P as WideMul>::Output],
+	) {
+		// The column arrives split on the round's highest variable.
+		// Its high half is the specialization at `X = 1`.
+		let col = chunk.col(self.col);
+
+		// R(1) = <M(.., X = 1), eq(.., z)> over this chunk.
+		// Only the eq multiply is widened.
+		// The wide accumulator is reduced once at the end of the chunk.
+		let mut y_1 = <P as WideMul>::Output::default();
+		for (idx, &eq_i) in eq_ind.as_ref().iter().enumerate() {
+			y_1 += P::wide_mul(col.hi.as_ref()[idx], eq_i);
+		}
+		accum[0] += y_1;
 	}
 
-	fn execute(&mut self) -> Vec<RoundCoeffs<F>> {
-		let sum = *self.last_coeffs_or_sum.claim();
-
-		let n_vars_remaining = self.n_vars();
+	fn interpolate(
+		&self,
+		store: &MleStore<'_, P>,
+		accum: &[P],
+		claim: F,
+		alpha: F,
+	) -> RoundCoeffs<F> {
+		// The store has not folded this round yet.
+		// Its remaining-variable count is therefore this round's.
+		let n_vars_remaining = store.n_vars();
 		assert!(n_vars_remaining > 0);
 
-		// The eq expansion is over the lower `n_vars_remaining - 1` variables; the top (X = 1) half
-		// of the witness is the partial specialization of the highest variable at 1.
-		let eq_expansion = self.gruen32.eq_expansion();
-		let (_evals_0, evals_1) = self.witness.split_half_ref();
-		debug_assert_eq!(eq_expansion.log_len(), evals_1.log_len());
-
-		// R(1) = <M(.., X = 1), eq(.., z)>, the multilinear evaluation of the top half.
-		// The products are accumulated in unreduced (wide) form and reduced once at the end.
-		let wide_y_1 = (evals_1.as_ref(), eq_expansion.as_ref())
-			.into_par_iter()
-			.map(|(&evals_1_i, &eq_i)| P::wide_mul(evals_1_i, eq_i))
-			.reduce(<P as WideMul>::Output::default, |lhs, rhs| lhs + rhs);
-		let round_evals = RoundEvals1 {
-			y_1: P::reduce(wide_y_1),
-		};
-
-		let alpha = self.gruen32.next_coordinate();
-		let round_coeffs = round_evals
+		// `accum` is already reduced by the prover's map pass.
+		// Sum its lanes, then interpolate.
+		// `claim` is this round's prime evaluation.
+		// `alpha` is the eq coordinate that ties it to the point.
+		RoundEvals1 { y_1: accum[0] }
 			.sum_scalars(n_vars_remaining)
-			.interpolate_eq(sum, alpha);
-
-		self.last_coeffs_or_sum = RoundState::Coeffs(round_coeffs.clone());
-		vec![round_coeffs]
-	}
-
-	fn fold(&mut self, challenge: F) {
-		let coeffs = self.last_coeffs_or_sum.coeffs();
-
-		assert!(self.n_vars() > 0);
-
-		let sum = coeffs.evaluate(challenge);
-
-		fold_highest_var_inplace(&mut self.witness, challenge);
-		self.gruen32.fold(challenge);
-
-		self.last_coeffs_or_sum = RoundState::Claim(sum);
-	}
-
-	fn finish(self) -> Vec<F> {
-		assert_eq!(self.n_vars(), 0, "finish called out of order; sumcheck rounds remain");
-
-		debug_assert_eq!(self.witness.log_len(), 0);
-		vec![self.witness.get(0)]
+			.interpolate_eq(claim, alpha)
 	}
 }
 
-impl<F: Field, P: PackedField<Scalar = F>> MleCheckProver<F> for MultilinearEvalProver<P> {
-	fn eval_point(&self) -> &[F] {
-		self.gruen32.eval_point()
-	}
+/// Builds an MLE-check prover for the multilinear extension evaluation of a single multilinear.
+///
+/// The claim is `M(z) = s` for a multilinear `M` over the challenge field.
+/// This proves the equivalent MLE-check relation `s = sum_{v in B_n} M(v) * eq(v, z)`.
+/// Since `M` is multilinear, that relation holds if and only if `M(z) = s`.
+///
+/// The reduction runs on the split-eq [`SharedMleCheckProver`] with a degree-1 evaluator.
+/// Each round expands only a small low-coordinate prefix of the eq indicator.
+/// The higher coordinates are folded in through the prover's reduction step.
+/// The full `2^{n-1}` eq tensor is never materialized, streamed, or folded per round.
+///
+/// # Arguments
+///
+/// * `witness` - the multilinear whose extension is evaluated.
+/// * `eval_point` - the point of the evaluation claim.
+/// * `eval_claim` - the claimed value of the multilinear extension at that point.
+///
+/// # Panics
+///
+/// Panics if the witness length does not match the evaluation point length.
+pub fn multilinear_eval_prover<F, P>(
+	witness: FieldBuffer<P>,
+	eval_point: &[F],
+	eval_claim: F,
+) -> SharedMleCheckProver<'static, F, P, MultilinearEvalEvaluator>
+where
+	F: Field,
+	P: PackedField<Scalar = F>,
+{
+	assert_eq!(
+		witness.log_len(),
+		eval_point.len(),
+		"witness must have number of variables equal to the evaluation point length"
+	);
+
+	// The store owns the witness as its single column.
+	// With no borrowed data, the shared prover is `'static`.
+	let mut store = MleStore::new(eval_point.len());
+	let col = store.push_owned(witness);
+	let evaluator = MultilinearEvalEvaluator::new(col);
+	SharedMleCheckProver::new(store, [(eval_claim, evaluator)], eval_point.to_vec())
 }
 
 #[cfg(test)]
@@ -144,7 +142,8 @@ mod tests {
 
 	use super::*;
 	use crate::sumcheck::{
-		prove_single_mlecheck, quadratic_mle_evaluator::quadratic_mlecheck_prover,
+		common::SumcheckProver, prove_single_mlecheck,
+		quadratic_mle_evaluator::quadratic_mlecheck_prover,
 	};
 
 	type F = OptimalB128;
@@ -165,7 +164,7 @@ mod tests {
 		let eval_point = random_scalars::<F>(&mut rng, n_vars);
 		let eval_claim = evaluate(&witness, &eval_point);
 
-		let mut eval_prover = MultilinearEvalProver::new(witness.clone(), &eval_point, eval_claim);
+		let mut eval_prover = multilinear_eval_prover(witness.clone(), &eval_point, eval_claim);
 		let mut quadratic_prover = quadratic_mlecheck_prover(
 			[witness],
 			|[a]: [P; 1]| a,
@@ -206,7 +205,7 @@ mod tests {
 		let eval_point = random_scalars::<F>(&mut rng, n_vars);
 		let eval_claim = evaluate(&witness, &eval_point);
 
-		let prover = MultilinearEvalProver::new(witness.clone(), &eval_point, eval_claim);
+		let prover = multilinear_eval_prover(witness.clone(), &eval_point, eval_claim);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
 		let output = prove_single_mlecheck(prover, &mut prover_transcript);
@@ -240,7 +239,7 @@ mod tests {
 		let eval_point = random_scalars::<F>(&mut rng, n_vars);
 		let eval_claim = evaluate(&witness, &eval_point);
 
-		let mut prover = MultilinearEvalProver::new(witness, &eval_point, eval_claim);
+		let mut prover = multilinear_eval_prover(witness, &eval_point, eval_claim);
 		assert_eq!(prover.round_claim(), vec![eval_claim]);
 
 		for _ in 0..n_vars {
