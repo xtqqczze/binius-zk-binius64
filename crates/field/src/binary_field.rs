@@ -476,15 +476,6 @@ macro_rules! impl_field_extension {
 			}
 
 			#[inline]
-			fn into_iter_bases(self) -> impl Iterator<Item = $subfield_name> {
-				use binius_utils::iter::IterExtensions;
-				use $crate::underlier::{Divisible, WithUnderlier};
-
-				Divisible::<<$subfield_name as WithUnderlier>::Underlier>::value_iter(self.0)
-					.map_skippable($subfield_name::from)
-			}
-
-			#[inline]
 			unsafe fn get_base_unchecked(&self, i: usize) -> $subfield_name {
 				use $crate::underlier::{Divisible, WithUnderlier};
 				// Safety: the caller guarantees `i < Self::N` (over subfield elements).
