@@ -5,6 +5,7 @@
 //! the hypercube), and a [`SharedMleCheckProver`] driving one [`QuadraticMleEvaluator`] (the
 //! evaluation claim on the product's multilinear extension at a random point).
 
+use binius_compute::BufferPool;
 use binius_field::{FieldOps, PackedField, arch::OptimalPackedB128};
 use binius_ip_prover::sumcheck::{
 	self,
@@ -14,10 +15,8 @@ use binius_ip_prover::sumcheck::{
 	round_evaluator::{SharedMleCheckProver, SharedSumcheckProver},
 };
 use binius_math::{
-	FieldBuffer,
-	inner_product::inner_product_par,
-	multilinear::evaluate::evaluate_inplace,
-	test_utils::{random_field_buffer, random_scalars},
+	FieldBuffer, inner_product::inner_product_par, multilinear::evaluate::evaluate_inplace,
+	test_utils::random_scalars,
 };
 use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -35,7 +34,15 @@ fn product<Pf: PackedField>([a, b]: [Pf; 2]) -> Pf {
 
 // The evaluation of the product `a * b`'s multilinear extension at `eval_point`, the MLE-check
 // claim.
-fn product_eval_claim(a: &FieldBuffer<P>, b: &FieldBuffer<P>, eval_point: &[F]) -> F {
+fn product_eval_claim<DataA, DataB>(
+	a: &FieldBuffer<P, DataA>,
+	b: &FieldBuffer<P, DataB>,
+	eval_point: &[F],
+) -> F
+where
+	DataA: std::ops::Deref<Target = [P]>,
+	DataB: std::ops::Deref<Target = [P]>,
+{
 	let n_vars = eval_point.len();
 	let packed_len = 1 << n_vars.saturating_sub(P::LOG_WIDTH);
 	let product_vals: Vec<P> = (0..packed_len)
@@ -53,8 +60,13 @@ fn bench_shared_sumcheck_bivariate_product(c: &mut Criterion) {
 	for n_vars in [12, 16, 20] {
 		group.throughput(Throughput::Elements(1 << n_vars));
 		group.bench_function(format!("n_vars={n_vars}"), |b| {
-			let a = random_field_buffer::<P>(&mut rng, n_vars);
-			let b_multilinear = random_field_buffer::<P>(&mut rng, n_vars);
+			let a_scalars = random_scalars::<F>(&mut rng, 1 << n_vars);
+			let b_scalars = random_scalars::<F>(&mut rng, 1 << n_vars);
+			let pool = BufferPool::new();
+			let alloc = &pool;
+			// Build the two multilinears once; each iteration clones them from the pool.
+			let a = FieldBuffer::<P>::from_values_in(&alloc, &a_scalars);
+			let b_multilinear = FieldBuffer::<P>::from_values_in(&alloc, &b_scalars);
 			// The plain sum claim is the sum of `a * b` over the hypercube.
 			let sum_claim = inner_product_par(&a, &b_multilinear);
 			let transcript = ProverTranscript::new(StdChallenger::default());
@@ -62,7 +74,7 @@ fn bench_shared_sumcheck_bivariate_product(c: &mut Criterion) {
 			b.iter_batched(
 				|| (transcript.clone(), a.clone(), b_multilinear.clone()),
 				|(mut transcript, a, b_multilinear)| {
-					let mut store = MleStore::new(n_vars);
+					let mut store = MleStore::new(n_vars, &alloc);
 					let cols = [a, b_multilinear].map(|col| store.push_owned(col));
 					let evaluator = BivariateProductEvaluator::new(cols);
 					let prover = SharedSumcheckProver::new(store, [(sum_claim, evaluator)]);
@@ -86,8 +98,13 @@ fn bench_shared_mlecheck_bivariate_product(c: &mut Criterion) {
 	for n_vars in [12, 16, 20] {
 		group.throughput(Throughput::Elements(1 << n_vars));
 		group.bench_function(format!("n_vars={n_vars}"), |b| {
-			let a = random_field_buffer::<P>(&mut rng, n_vars);
-			let b_multilinear = random_field_buffer::<P>(&mut rng, n_vars);
+			let a_scalars = random_scalars::<F>(&mut rng, 1 << n_vars);
+			let b_scalars = random_scalars::<F>(&mut rng, 1 << n_vars);
+			let pool = BufferPool::new();
+			let alloc = &pool;
+			// Build the two multilinears once; each iteration clones them from the pool.
+			let a = FieldBuffer::<P>::from_values_in(&alloc, &a_scalars);
+			let b_multilinear = FieldBuffer::<P>::from_values_in(&alloc, &b_scalars);
 			let eval_point = random_scalars::<F>(&mut rng, n_vars);
 			let eval_claim = product_eval_claim(&a, &b_multilinear, &eval_point);
 			let transcript = ProverTranscript::new(StdChallenger::default());
@@ -95,7 +112,7 @@ fn bench_shared_mlecheck_bivariate_product(c: &mut Criterion) {
 			b.iter_batched(
 				|| (transcript.clone(), a.clone(), b_multilinear.clone(), eval_point.clone()),
 				|(mut transcript, a, b_multilinear, eval_point)| {
-					let mut store = MleStore::new(n_vars);
+					let mut store = MleStore::new(n_vars, &alloc);
 					let cols = [a, b_multilinear].map(|col| store.push_owned(col));
 					let evaluator = QuadraticMleEvaluator::new(cols, product::<P>, product::<P>);
 					let prover =
